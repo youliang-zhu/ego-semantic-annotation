@@ -9,16 +9,16 @@
 - `examples/wgo_ego/api_recording.py`：实际 prompt、图片、输出 Schema、原始响应记录。
 - [Windows 使用说明](docs/examples/annotations/wgo-ego-windows.md)：安装、目录结构、API Key 配置及运行方法。
 
-在项目根目录运行：
+在项目根目录运行已验证成功的叠毛巾片段：
 
 ```powershell
-.\run_wgo_demo.ps1 -Prepare
-.\run_wgo_demo.ps1 -RecordApi
+.\run_wgo_demo.ps1 -Prepare -DataRoot '..\datasets\wgo-bench-ego-homer_56' -OutputRoot '.\artifacts\wgo-ego-homer_56'
+.\run_wgo_demo.ps1 -RecordApi -DataRoot '..\datasets\wgo-bench-ego-homer_56' -OutputRoot '.\artifacts\wgo-ego-homer_56'
 ```
 
-API Key 填在项目根目录 `.env`（参考 `.env.example`）。本地环境使用 `.venv/`，输出写入 `artifacts/wgo-ego-demo/`，数据集位于项目上一级的 `datasets/wgo-bench-ego/`。这些本地文件不提交到 Git；新克隆需要安装依赖并准备数据，详见使用说明。
+API Key 填在项目根目录 `.env`（参考 `.env.example`）。本地环境使用 `.venv/`。上述命令的输出写入 `artifacts/wgo-ego-homer_56/`，数据集位于项目上一级的 `datasets/wgo-bench-ego-homer_56/`。不指定目录时仍使用原来的 `wgo-bench-ego` 数据和 `wgo-ego-demo` 输出。这些本地文件不提交到 Git；新克隆需要安装依赖并准备数据，详见使用说明。
 
-实验状态：视频预处理和 API 记录已经验证。当前 `homer_1` 片段被 Gemini 返回 `PROHIBITED_CONTENT`，尚无成功的完整标注或评估分数。原始 GT 保留源字段和时间精度。第二轮为标签修正，不是 benchmark 评分；仓库不包含博客的完整评估器。
+实验状态（2026-10-10）：`homer_56` 的前 16.67 秒已完成两轮标注，4 次 API 请求全部成功，得到 3 段预测；源 GT 有 4 段。完整 prompt、11 张实际输入图片、Schema 和原始响应均已保存并校验。打开输出目录的 `api-recording.html` 查看请求，`comparison.html` 查看原始 GT 对照。局部时间分段 F1 为 0.571（IoU ≥ 0.75、评分时对齐首尾；未运行语义评分模型，不是完整 benchmark 得分）。原先 `homer_1` 倒水片段仍返回 `PROHIBITED_CONTENT`，记录保留。第二轮为标签修正，不是 benchmark 评分；仓库不包含博客的完整评估器。
 
 以下为上游项目介绍。
 

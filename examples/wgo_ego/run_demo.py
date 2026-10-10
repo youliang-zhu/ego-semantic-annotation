@@ -50,22 +50,23 @@ def render_report(result=None):
     original_path = DATA_ROOT / "clip.gt.original.json"
     if original_path.exists():
         original_text = original_path.read_text(encoding="utf-8")
+        source_id = sample.get("source_id", sample["id"].split("_0-")[0])
         links = " · ".join(
             f'<a href="{html.escape(Path(os.path.relpath(DATA_ROOT / name, ROOT)).as_posix(), quote=True)}">{name}</a>'
             for name in (
                 "clip.gt.original.json",
-                "homer_1.gt.original.json",
-                "homer_1.original.parquet",
+                f"{source_id}.gt.original.json",
+                f"{source_id}.original.parquet",
                 "gt.provenance.json",
             )
         )
         original_gt = (
-            "<h2>HF 原始 GT</h2><p>下面保留前五段的原字段、英文标签和时间值。"
-            "完整样本有 20 段；Parquet 保留整行数据（含视频），JSON 仅省略二进制视频。"
+            "<h2>HF 原始 GT</h2><p>下面保留本片段 GT 的原字段、英文标签和时间值。"
+            "完整样本见下方文件；Parquet 保留整行数据（含视频），JSON 仅省略二进制视频。"
             "单行 Parquet 经重新序列化，字段和值已校验一致。</p>"
             f"<p>{links}</p><pre>{html.escape(original_text)}</pre>"
-            "<p>GT 终点为 26.514 秒，编码后视频时长为 26.536077 秒。"
-            "GT 未为补齐这约 22 毫秒而改写。</p>"
+            f"<p>GT 截取终点为 {sample.get('clip_requested_end_sec', sample['clip_duration_sec'])} 秒，"
+            f"编码后视频时长为 {sample['clip_duration_sec']} 秒。GT 时间值未改写。</p>"
         )
     predicted = (
         ""
@@ -82,7 +83,7 @@ def render_report(result=None):
 <h2>第一轮实际使用的输入拼图</h2><p>每 0.5 秒取一帧，224px 宽，每张最多 20 帧，5 列；所有拼图一起发送。</p>{sheets}
 {original_gt}
 {segment_table("GT 时间概览（显示到两位小数；精确值见上方原始 JSON）", sample["gold_segments"])}{predicted}
-<p>样本信息位于 semantic annotation/datasets/wgo-bench-ego/sample.json；处理信息见 preparation.json，完成推理后见 result.json。</p></html>'''
+<p>样本信息：{html.escape(str(DATA_ROOT / "sample.json"))}；处理信息见 preparation.json，完成推理后见 result.json。</p></html>'''
     (ROOT / "preview.html").write_text(page, encoding="utf-8")
 
 
@@ -136,6 +137,8 @@ def save_first_pass(row):
 
 
 def main():
+    global DATA_ROOT, ROOT
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--prepare",
@@ -145,12 +148,20 @@ def main():
     parser.add_argument("--provider", choices=["google", "openai"], default="google")
     parser.add_argument("--model", default="gemini-3.8-flash")
     parser.add_argument("--base-url")
+    parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
+    parser.add_argument("--output-root", type=Path, default=ROOT)
     parser.add_argument(
         "--record-api",
         action="store_true",
         help="Save actual API prompts, image bytes, schemas and raw responses.",
     )
     args = parser.parse_args()
+    DATA_ROOT = args.data_root.resolve()
+    ROOT = args.output_root.resolve()
+    if not DATA_ROOT.is_relative_to(PROJECT_ROOT.parent):
+        parser.error("--data-root must be inside the semantic annotation directory")
+    if not ROOT.is_relative_to(PROJECT_ROOT / "artifacts"):
+        parser.error("--output-root must be inside the project's artifacts directory")
     # Resolve the project root regardless of the terminal's current directory.
     # Existing process environment variables take priority over .env values.
     load_dotenv(PROJECT_ROOT / ".env", override=False, encoding="utf-8-sig")

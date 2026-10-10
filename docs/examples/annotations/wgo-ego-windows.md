@@ -8,6 +8,35 @@ subtask annotation on the first 26.54 seconds of WGO-Bench's `homer_1` episode.
 The dataset's five gold segments are displayed for comparison and are never
 passed to the model. This cropped demo is not a full benchmark evaluation.
 
+For the successfully tested sample, use the `homer_56` towel-folding clip:
+
+```powershell
+.\run_wgo_demo.ps1 -RecordApi -DataRoot '..\datasets\wgo-bench-ego-homer_56' -OutputRoot '.\artifacts\wgo-ego-homer_56'
+```
+
+On 2026-10-10 this 16.67-second clip completed both passes with
+`gemini-3.8-flash`: one segmentation request and three labeling requests, all
+successful. All 11 recorded input images were verified byte-for-byte against
+the actual request bodies, and no API key appeared in the captures. Open
+`artifacts/wgo-ego-homer_56/api-recording.html` for the complete inputs and
+outputs, or `comparison.html` for the raw GT comparison. These pages are local
+run artifacts, not files included in a fresh clone.
+
+The model produced three segments against four original GT segments, merging
+the initial pickup and unfolding actions. A local temporal-only comparison
+at IoU >= 0.75, with outer boundaries snapped for scoring, matched two GT
+segments (precision 0.667, recall 0.500, F1 0.571). No semantic judge ran;
+this is not the full benchmark's end-to-end score.
+
+The alternate folder preserves the complete source row in
+`homer_56.original.parquet`, its non-video fields in `homer_56.gt.original.json`,
+and the first four unmodified GT segments in `clip.gt.original.json`.
+The source instruction is empty and remains empty in the model input.
+The requested clip ends at 16.636 seconds; encoding produces 16.666667 seconds.
+The downloaded episode video is approximately 9.9 MB. The original pouring
+sample and its blocked requests remain in their original directories below;
+omitting the directory arguments still selects that original sample.
+
 ## Layout
 
 All task files live under `semantic annotation`:
@@ -88,6 +117,12 @@ GPU is required. A fresh environment needs the project's `video` extra and
 
 ## Record complete API inputs and outputs
 
+To run a different prepared sample without overwriting earlier outputs, pass
+`-DataRoot` and `-OutputRoot` to the launcher (or `--data-root` and
+`--output-root` to the Python runner). Keep datasets inside `semantic annotation`
+and choose a separate output directory inside the project's `artifacts/`.
+The alternate dataset directory must contain `clip.mp4` and `sample.json`.
+
 Run `.\run_wgo_demo.ps1 -RecordApi` to save every actual HTTP attempt under
 the new run's `api/` folder. Open `api/index.html` to inspect all requests in
 order, including any failed attempts. API keys are excluded.
@@ -143,7 +178,7 @@ boundaries to gold boundaries, and a Gemini 3.5 Flash label judge. Its rubric
 is published under Grading in the linked blog. The demo's Gemini 3.8 Flash
 is the annotation model; it does not automatically become an evaluation judge.
 
-The API run on 2026-10-10 was blocked during segmentation with
+The original `homer_1` API run on 2026-10-10 was blocked during segmentation with
 `promptFeedback.blockReason=PROHIBITED_CONTENT`, including the built-in retry.
 No predictions or evaluation scores were produced. This is a failed inference
 run, not a zero benchmark score. The preview and `run-status.json` record this
@@ -177,6 +212,6 @@ timestamped-contact-sheet function: 0.5-second sampling, 224px tile width,
 
 The source dataset is
 [macrodata/WGO-Bench](https://huggingface.co/datasets/macrodata/WGO-Bench), pinned
-to revision `9cfb7bb98d60a58319f4b3d7b41374eedfb7980c`. Only the first episode's
-video column and small Parquet metadata ranges were downloaded, approximately
-25 MB rather than the complete 1.4 GB dataset.
+to revision `9cfb7bb98d60a58319f4b3d7b41374eedfb7980c`. Only the selected episodes'
+video columns and small Parquet metadata ranges were downloaded: approximately
+25 MB for `homer_1` and 9.9 MB for `homer_56`, rather than the complete 1.4 GB dataset.
