@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+SHARD_ID_COLUMN = "__shard_id"
+SOURCE_ROW_ID_COLUMN = "__source_row_id"
+INTERNAL_ROW_COLUMNS = (SHARD_ID_COLUMN, SOURCE_ROW_ID_COLUMN)
+
+
+class _HashWriter(Protocol):
+    def update(self, data: bytes, /) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FilePart:
+    """One planned file span inside a file-backed shard descriptor.
+
+    `start/end` are planning offsets only:
+        - `end == -1` means the file is atomic and should be read whole.
+        - Otherwise readers adapt the span to the boundary that makes sense for
+          that format at `read_shard()` time.
+    """
+
+    path: str
+    start: int
+    end: int
+    source_index: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def locality_key(self) -> str:
+        return path_hash(self.path, source_index=self.source_index)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "path": self.path,
+            "start": int(self.start),
+            "end": int(self.end),
+            "source_index": int(self.source_index),
+        }
+        if self.metadata:
+            out["metadata"] = dict(self.metadata)
+        return out
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> FilePart:
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("file part metadata must be an object")
+        return cls(
+            path=str(payload["path"]),
+            start=int(payload["start"]),
+            end=int(payload["end"]),
+            source_index=int(payload.get("source_index", 0)),
+            metadata=dict(metadata),
+        )
+
+    def update_hash(self, h: _HashWriter) -> None:
+        h.update(self.path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(self.start).encode("ascii"))
+        h.update(b"\0")
+        h.update(str(self.end).encode("ascii"))
+        h.update(b"\0")
+        h.update(str(self.source_index).encode("ascii"))
+        h.update(b"\0")
+
+
+@dataclass(frozen=True, slots=True)
+class FilePartsDescriptor:
+    """Descriptor for file-backed shards planned as one or more file spans."""
+
+    parts: tuple[FilePart, ...]
+
+    def __post_init__(self) -> None:
+        if not self.parts:
+            raise ValueError("shard parts must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": "file_parts", "parts": [part.to_dict() for part in self.parts]}
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> FilePartsDescriptor:
+        parts = payload["parts"]
+        if not isinstance(parts, list):
+            raise ValueError("file-parts descriptor must contain a parts list")
+        if any(not isinstance(part, dict) for part in parts):
+            raise ValueError("file-parts descriptor parts must be objects")
+        return cls(tuple(FilePart.from_dict(part) for part in parts))
+
+    def update_hash(self, h: _HashWriter) -> None:
+        h.update(b"file_parts\0")
+        for part in self.parts:
+            part.update_hash(h)
+
+    @property
+    def descriptor_start_key(self) -> str:
+        return self.parts[0].locality_key
+
+    @property
+    def descriptor_end_key(self) -> str:
+        return self.parts[-1].locality_key
+
+
+@dataclass(frozen=True, slots=True)
+class RowRangeDescriptor:
+    """Descriptor for row-backed sources, optionally pinned to a source version."""
+
+    start: int
+    end: int
+    source_version: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.end < self.start:
+            raise ValueError("row-range end must be >= start")
+        if self.source_version is not None and self.source_version < 0:
+            raise ValueError("row-range source version must be >= 0")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "kind": "row_range",
+            "start": int(self.start),
+            "end": int(self.end),
+        }
+        if self.source_version is not None:
+            payload["source_version"] = int(self.source_version)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> RowRangeDescriptor:
+        return cls(
+            start=int(payload["start"]),
+            end=int(payload["end"]),
+            source_version=(
+                int(payload["source_version"])
+                if payload.get("source_version") is not None
+                else None
+            ),
+        )
+
+    def update_hash(self, h: _HashWriter) -> None:
+        h.update(b"row_range\0")
+        h.update(str(self.start).encode("ascii"))
+        h.update(b"\0")
+        h.update(str(self.end).encode("ascii"))
+        h.update(b"\0")
+        if self.source_version is not None:
+            h.update(str(self.source_version).encode("ascii"))
+            h.update(b"\0")
+
+    @property
+    def descriptor_start_key(self) -> str | None:
+        return None
+
+    @property
+    def descriptor_end_key(self) -> str | None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class ShardGroupDescriptor:
+    """Ordered source shards executed as one scheduling unit.
+
+    This keeps a wrapper source's physical plan attached to the claimed shard,
+    so remote workers do not need to discover or re-plan the child shards.
+    """
+
+    shards: tuple[Shard, ...]
+
+    def __post_init__(self) -> None:
+        if not self.shards:
+            raise ValueError("shard group must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "shard_group",
+            "shards": [shard.to_dict() for shard in self.shards],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ShardGroupDescriptor:
+        shards = payload["shards"]
+        if not isinstance(shards, list):
+            raise ValueError("shard-group descriptor must contain a shards list")
+        if any(not isinstance(shard, dict) for shard in shards):
+            raise ValueError("shard-group descriptor shards must be objects")
+        return cls(tuple(Shard.from_dict(shard) for shard in shards))
+
+    def update_hash(self, h: _HashWriter) -> None:
+        h.update(b"shard_group\0")
+        for shard in self.shards:
+            h.update(shard.id.encode("ascii"))
+            h.update(b"\0")
+
+    @property
+    def descriptor_start_key(self) -> str | None:
+        return self.shards[0].start_key
+
+    @property
+    def descriptor_end_key(self) -> str | None:
+        return self.shards[-1].end_key
+
+
+ShardDescriptor = FilePartsDescriptor | RowRangeDescriptor | ShardGroupDescriptor
+
+
+@dataclass(frozen=True, slots=True)
+class Shard:
+    """Logical unit of source work plus scheduling hints.
+
+    The descriptor says what to read. `global_ordinal`, `start_key`, and
+    `end_key` are planning hints used by the local/cloud claim logic.
+    """
+
+    descriptor: ShardDescriptor
+    global_ordinal: int | None = None
+    start_key: str | None = None
+    end_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.start_key is None:
+            object.__setattr__(self, "start_key", self.descriptor.descriptor_start_key)
+        if self.end_key is None:
+            object.__setattr__(self, "end_key", self.descriptor.descriptor_end_key)
+
+    @classmethod
+    def from_file_parts(
+        cls,
+        file_parts: list[FilePart] | tuple[FilePart, ...],
+        *,
+        global_ordinal: int | None = None,
+        start_key: str | None = None,
+        end_key: str | None = None,
+    ) -> Shard:
+        if not file_parts:
+            raise ValueError("file parts must be non-empty")
+        return cls(
+            descriptor=FilePartsDescriptor(tuple(file_parts)),
+            global_ordinal=global_ordinal,
+            start_key=start_key,
+            end_key=end_key,
+        )
+
+    @classmethod
+    def from_row_range(
+        cls,
+        *,
+        start: int,
+        end: int,
+        global_ordinal: int | None = None,
+        start_key: str | None = None,
+        end_key: str | None = None,
+        source_version: int | None = None,
+    ) -> Shard:
+        return cls(
+            descriptor=RowRangeDescriptor(
+                start=start,
+                end=end,
+                source_version=source_version,
+            ),
+            global_ordinal=global_ordinal,
+            start_key=start_key,
+            end_key=end_key,
+        )
+
+    @property
+    def id(self) -> str:
+        h = hashlib.blake2b(digest_size=6)
+        self.descriptor.update_hash(h)
+        h.update(str(self.global_ordinal).encode("utf-8"))
+        h.update(b"\0")
+        h.update((self.start_key or "").encode("utf-8"))
+        h.update(b"\0")
+        h.update((self.end_key or "").encode("utf-8"))
+        return h.hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "shard_id": self.id,
+            "global_ordinal": self.global_ordinal,
+            "start_key": self.start_key,
+            "end_key": self.end_key,
+            "descriptor": self.descriptor.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> Shard:
+        descriptor = payload["descriptor"]
+        if not isinstance(descriptor, dict):
+            raise ValueError("shard descriptor must be an object")
+        kind = descriptor.get("kind")
+        if kind == "file_parts":
+            parsed_descriptor: ShardDescriptor = FilePartsDescriptor.from_dict(
+                descriptor
+            )
+        elif kind == "row_range":
+            parsed_descriptor = RowRangeDescriptor.from_dict(descriptor)
+        elif kind == "shard_group":
+            parsed_descriptor = ShardGroupDescriptor.from_dict(descriptor)
+        else:
+            raise ValueError(f"unsupported shard descriptor kind: {kind!r}")
+        global_ordinal = payload.get("global_ordinal")
+        start_key = payload.get("start_key")
+        end_key = payload.get("end_key")
+        if global_ordinal is not None and not isinstance(global_ordinal, int):
+            raise ValueError("global_ordinal must be an integer or null")
+        if start_key is not None and not isinstance(start_key, str):
+            raise ValueError("start_key must be a string or null")
+        if end_key is not None and not isinstance(end_key, str):
+            raise ValueError("end_key must be a string or null")
+        return cls(
+            descriptor=parsed_descriptor,
+            global_ordinal=global_ordinal,
+            start_key=start_key,
+            end_key=end_key,
+        )
+
+
+def path_hash(path: str, *, source_index: int = 0) -> str:
+    h = hashlib.blake2b(digest_size=6)
+    h.update(path.encode("utf-8"))
+    h.update(b"\0")
+    h.update(str(int(source_index)).encode("ascii"))
+    return h.hexdigest()
+
+
+__all__ = [
+    "FilePart",
+    "FilePartsDescriptor",
+    "RowRangeDescriptor",
+    "Shard",
+    "ShardDescriptor",
+    "ShardGroupDescriptor",
+    "path_hash",
+]

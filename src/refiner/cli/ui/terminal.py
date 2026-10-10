@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import sys
+
+from refiner.platform.client import UserIdentity
+
+ASCII_BANNER = r"""
+
+███╗   ███╗ █████╗  ██████╗██████╗  ██████╗ ██████╗  █████╗ ████████╗ █████╗     ██╗      █████╗ ██████╗ ███████╗
+████╗ ████║██╔══██╗██╔════╝██╔══██╗██╔═══██╗██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗    ██║     ██╔══██╗██╔══██╗██╔════╝
+██╔████╔██║███████║██║     ██████╔╝██║   ██║██║  ██║███████║   ██║   ███████║    ██║     ███████║██████╔╝███████╗
+██║╚██╔╝██║██╔══██║██║     ██╔══██╗██║   ██║██║  ██║██╔══██║   ██║   ██╔══██║    ██║     ██╔══██║██╔══██╗╚════██║
+██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║╚██████╔╝██████╔╝██║  ██║   ██║   ██║  ██║    ███████╗██║  ██║██████╔╝███████║
+╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝
+"""
+
+
+def print_banner() -> None:
+    print(ASCII_BANNER.strip("\n"))
+
+
+def display_identity(user: UserIdentity) -> str:
+    name = (user.name or "").strip()
+    username = (user.username or "").strip()
+    email = (user.email or "").strip()
+
+    label = username or name or "unknown user"
+    if email:
+        return f"{label} ({email})"
+    return label
+
+
+def stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except Exception:  # pragma: no cover
+        return False
+
+
+def stdout_is_interactive() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except Exception:  # pragma: no cover
+        return False

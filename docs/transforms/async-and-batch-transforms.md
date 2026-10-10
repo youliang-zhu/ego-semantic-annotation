@@ -1,0 +1,149 @@
+---
+title: "Async and batch transforms"
+description: "Use map_async, batch_map, and batch_map_async for concurrent I/O and batched model work"
+---
+
+# Async and batch transforms
+
+Use async and batch transforms when a row transform would be too slow one row at
+a time.
+
+## `map_async`
+
+`map_async` runs an async function over rows with bounded concurrency.
+
+```python
+async def classify_episode(row):
+    label = "long" if row.num_frames > 300 else "short"
+    return row.update({"label": label})
+
+
+pipeline = pipeline.map_async(
+    classify_episode,
+    max_in_flight=32,
+    preserve_order=True,
+)
+```
+
+Use `max_in_flight` to match provider rate limits, memory limits, or open file
+limits.
+
+For expensive worker-local state, pass a zero-argument `factory` instead of a
+callback:
+
+```python
+class Classifier:
+    def __init__(self):
+        self.client = create_client()
+
+    async def __call__(self, row):
+        label = await self.client.classify(row["text"])
+        return {"label": label}
+
+
+def create_classifier():
+    return Classifier()
+
+
+pipeline = pipeline.map_async(
+    factory=create_classifier,
+    max_in_flight=32,
+)
+```
+
+When callbacks return large values such as image or video bytes, set a small
+execution block row limit:
+
+```python
+pipeline = pipeline.with_max_block_rows(16)
+```
+
+The row limit applies to source and transformed Python row blocks before they
+reach the sink. Callback results that are still in flight are separate, so
+choose `max_in_flight` and `max_block_rows` with the largest expected result in
+mind. `with_max_vectorized_block_bytes(...)` applies only to Arrow blocks from
+sources or vectorized operations; it does not estimate the size of Python row
+values.
+
+## Inference helpers
+
+Most model calls should use Refiner's inference helpers instead of calling an
+API directly:
+
+```python
+pipeline = pipeline.map_async(
+    mdr.inference.generate_text(
+        fn=annotate,
+        provider=mdr.inference.OpenAIResponsesProvider(model="gpt-4.1"),
+        max_concurrent_requests=64,
+    ),
+    max_in_flight=64,
+)
+```
+
+See [Generate Text](../inference/generate-text.md).
+
+## `batch_map`
+
+`batch_map` receives a list of rows and returns rows.
+
+```python
+def add_batch_rank(rows):
+    for index, row in enumerate(rows):
+        yield row.update({"batch_rank": index})
+
+
+pipeline = pipeline.batch_map(add_batch_rank, batch_size=32)
+```
+
+Use this for perception pipelines or model APIs that naturally process batches.
+
+Use `factory` when constructing the batch callback loads a model or another
+expensive resource:
+
+```python
+def create_batch_model():
+    model = load_model("model.pt")
+
+    def infer(rows):
+        return model.predict(rows)
+
+    return infer
+
+
+pipeline = pipeline.batch_map(
+    factory=create_batch_model,
+    batch_size=32,
+)
+```
+
+## `batch_map_async`
+
+`batch_map_async` processes multiple batches concurrently. Use
+`max_in_flight` to bound concurrency and `preserve_order` when output order
+must match input order:
+
+```python
+pipeline = pipeline.batch_map_async(
+    factory=create_async_batch_model,
+    batch_size=64,
+    max_in_flight=2,
+    preserve_order=True,
+)
+```
+
+The callback receives `list[Row]` and returns rows, either directly or through
+an awaitable.
+
+## Order and backpressure
+
+| Setting | Effect |
+| --- | --- |
+| `preserve_order=True` | Output order follows input order. |
+| `preserve_order=False` | Faster rows may be emitted first. |
+| Smaller `max_in_flight` | Lower memory and lower external pressure. |
+| Larger `max_in_flight` | More concurrency, but easier to hit rate limits. |
+
+## Related pages
+
+- [Subtask Annotation](../episode-operations/subtask-annotation.md)

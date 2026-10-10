@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+import argparse
+import os
+import runpy
+import sys
+from pathlib import Path
+
+from refiner.cli.run.modes import (
+    CloudAttachDetached,
+    _ATTACH_MODE_ENV_VAR,
+    normalize_attach_mode,
+)
+from refiner.cli.run.local import LocalLaunchInterrupted, LocalLaunchResumeError
+
+
+def _attach_mode_arg(args: argparse.Namespace) -> str:
+    if getattr(args, "attach", False):
+        return "attach"
+    if getattr(args, "detach", False):
+        return "detach"
+    return "auto"
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    script = Path(args.script).expanduser()
+    if not script.exists():
+        print(f"Script not found: {script}", file=sys.stderr)
+        return 1
+    if not script.is_file():
+        print(f"Not a file: {script}", file=sys.stderr)
+        return 1
+
+    script_args = list(args.script_args)
+    if script_args[:1] == ["--"]:
+        script_args = script_args[1:]
+    original_argv = sys.argv
+    original_sys_path = list(sys.path)
+    original_logs = os.environ.get("REFINER_LOGS")
+    original_attach = os.environ.get(_ATTACH_MODE_ENV_VAR)
+    cwd_entries = {"", str(Path.cwd())}
+    try:
+        os.environ[_ATTACH_MODE_ENV_VAR] = normalize_attach_mode(_attach_mode_arg(args))
+        if args.logs is not None:
+            os.environ["REFINER_LOGS"] = args.logs
+        elif original_logs is None:
+            os.environ.pop("REFINER_LOGS", None)
+        sys.argv = [str(script), *script_args]
+        sys.path = [
+            str(script.parent.resolve()),
+            *[entry for entry in original_sys_path if entry not in cwd_entries],
+        ]
+        try:
+            runpy.run_path(str(script), run_name="__main__")
+        except BrokenPipeError:
+            return 141
+        except KeyboardInterrupt as err:
+            if isinstance(err, CloudAttachDetached):
+                return 130
+            if err.args and not sys.stdout.isatty():
+                print(str(err), file=sys.stderr)
+            elif not err.args:
+                print("Interrupted.", file=sys.stderr)
+            return 130
+        except LocalLaunchResumeError as err:
+            if not sys.stdout.isatty():
+                print(str(err), file=sys.stderr)
+            return 1
+        except SystemExit as err:
+            if isinstance(err, LocalLaunchInterrupted):
+                if str(err) and not sys.stdout.isatty():
+                    print(str(err), file=sys.stderr)
+                return 130
+            code = err.code
+            if code is None:
+                return 0
+            if isinstance(code, int):
+                return code
+            print(str(code), file=sys.stderr)
+            return 1
+    finally:
+        sys.argv = original_argv
+        sys.path = original_sys_path
+        if original_logs is None:
+            os.environ.pop("REFINER_LOGS", None)
+        else:
+            os.environ["REFINER_LOGS"] = original_logs
+        if original_attach is None:
+            os.environ.pop(_ATTACH_MODE_ENV_VAR, None)
+        else:
+            os.environ[_ATTACH_MODE_ENV_VAR] = original_attach
+    return 0

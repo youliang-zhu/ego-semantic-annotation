@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from abc import ABC
+from typing import Any, cast
+
+import pyarrow as pa
+
+from refiner.execution.tracking.shards import count_block_by_shard
+from refiner.pipeline.data.block import Block, split_block_by_shard
+from refiner.worker.metrics.api import log_throughput
+
+
+class BaseSink(ABC):
+    """Base sink interface with shard-local writes as the default behavior.
+
+    Most sinks should implement `write_shard_block(...)` and inherit the default
+    `write_block(...)` behavior. Override `write_block(...)` only for sinks that
+    do not operate shard-by-shard, such as pure counting or global reduction
+    sinks.
+    """
+
+    def write_block(self, block: Block) -> tuple[dict[str, int], int]:
+        """Split a mixed block by shard and dispatch each shard-local block.
+
+        This is the normal entry point and should usually be inherited as-is.
+        """
+        blocks_by_shard, counts = split_block_by_shard(block)
+        output_rows = 0
+        for shard_id, shard_block in blocks_by_shard.items():
+            actual_count = self.write_shard_block(shard_id, shard_block)
+            output_count = counts[shard_id] if actual_count is None else actual_count
+            log_throughput(
+                "rows_written",
+                output_count,
+                shard_id=shard_id,
+                unit="rows",
+            )
+            output_rows += output_count
+        return counts, output_rows
+
+    def write_shard_block(self, shard_id: str, block: Block) -> int | None:
+        """Write one already shard-local block.
+
+        This is the main method concrete shard-writing sinks should implement.
+        Return the actual row count when the sink can drop or expand rows;
+        otherwise return None to use the input block count.
+        """
+        del shard_id, block
+        raise NotImplementedError
+
+    def describe(self) -> tuple[str, str, dict[str, Any] | None] | None:
+        """Return an optional sink description for planning and tracing output.
+
+        Override this when the sink should expose structured configuration in
+        pipeline descriptions.
+        """
+        return None
+
+    def required_refiner_extras(self) -> tuple[str, ...]:
+        """macrodata-refiner extras required by this sink."""
+        return tuple(
+            sorted(
+                {
+                    *self._declared_refiner_extras(),
+                    *self._io_refiner_extras(),
+                }
+            )
+        )
+
+    def _declared_refiner_extras(self) -> tuple[str, ...]:
+        """Feature extras declared by this sink."""
+        return ()
+
+    def _io_refiner_extras(self) -> tuple[str, ...]:
+        """Storage extras required by this sink's output, if it has one."""
+        if not hasattr(self, "output"):
+            return ()
+        return cast(Any, self).output.required_refiner_extras()
+
+    def set_input_schema(self, schema: pa.Schema | None) -> None:
+        """Receive the schema expected at this sink boundary before writing starts."""
+        del schema
+
+    def set_input_dtype_columns(self, columns: frozenset[str]) -> None:
+        """Receive columns whose output types were explicitly declared."""
+        del columns
+
+    @property
+    def counts_output_rows(self) -> bool:
+        """Whether blocks written into this sink should count toward output_rows."""
+        return True
+
+    def on_shard_complete(self, shard_id: str) -> None:
+        """Flush or finalize state for one shard after upstream completion.
+
+        Override this only when the sink keeps shard-local buffered state that
+        should be finalized before `close()`.
+        """
+        del shard_id
+
+    def on_shard_finalized(self, shard_id: str) -> None:
+        """Run cleanup after the shard has been marked complete."""
+        del shard_id
+
+    def close(self) -> None:
+        """Finalize sink resources after all shard work is complete.
+
+        Override this when the sink keeps process-wide resources or deferred
+        state that should be flushed at the end of execution.
+        """
+        return None
+
+
+class NullSink(BaseSink):
+    """Sink that discards data and only reports shard counts."""
+
+    def write_block(self, block: Block) -> tuple[dict[str, int], int]:
+        counts = count_block_by_shard(block)
+        return counts, sum(counts.values())
+
+
+__all__ = ["BaseSink", "NullSink"]

@@ -1,0 +1,635 @@
+from __future__ import annotations
+
+import cloudpickle
+import pyarrow as pa
+import pytest
+from fsspec.implementations.memory import MemoryFileSystem
+
+from refiner import AddColumns, from_items, load_lance, read_blob
+from refiner.pipeline.data import datatype
+from refiner.pipeline.data.shard import (
+    SOURCE_ROW_ID_COLUMN,
+    RowRangeDescriptor,
+    Shard,
+    ShardGroupDescriptor,
+)
+from refiner.pipeline.sources.lance import LanceSource
+from refiner.pipeline.sources.limited import LimitedSource
+from refiner.pipeline.data.tabular import Tabular
+from refiner.pipeline.planning import compile_pipeline_plan
+
+
+def test_load_lance_rejects_explicit_shard_count_above_limit() -> None:
+    with pytest.raises(ValueError, match=r"num_shards must be <= 10,000"):
+        LanceSource("unused.lance", num_shards=10_001)
+
+
+def test_load_lance_caps_automatic_shards_without_dropping_fragments() -> None:
+    source = object.__new__(LanceSource)
+    source.num_shards = None
+    source._dataset_cache = type(
+        "Dataset",
+        (),
+        {"get_fragments": lambda self: [None] * 1_001},
+    )()
+    source._version_ref = [1]
+
+    shards = source.list_shards()
+
+    assert len(shards) == 1_000
+    assert shards[0].descriptor.start == 0
+    assert shards[-1].descriptor.end == 1_001
+
+
+def test_load_lance_pins_version_and_shards_by_fragment(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "input.lance"
+    version_one = lance.write_dataset(
+        pa.table({"x": [1, 2, 3]}),
+        str(dataset_uri),
+        max_rows_per_file=2,
+    ).version
+    lance.write_dataset(
+        pa.table({"x": [4]}),
+        str(dataset_uri),
+        mode="append",
+    )
+
+    pipeline = load_lance(
+        dataset_uri,
+        version=version_one,
+        columns=["x"],
+    )
+    shards = pipeline.list_shards()
+
+    assert isinstance(pipeline.source, LanceSource)
+    assert pipeline.source.version == version_one
+    assert len(shards) == 2
+    assert all(isinstance(shard.descriptor, RowRangeDescriptor) for shard in shards)
+    assert [(shard.descriptor.start, shard.descriptor.end) for shard in shards] == [
+        (0, 1),
+        (1, 2),
+    ]
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == [1, 2, 3]
+
+
+def test_load_lance_defers_and_pins_latest_version_until_first_use(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "deferred.lance"
+    pipeline = load_lance(dataset_uri)
+
+    version_one = lance.write_dataset(
+        pa.table({"x": [1]}),
+        str(dataset_uri),
+    ).version
+    assert pipeline.source.describe()["version"] is None
+
+    pipeline.list_shards()
+    assert isinstance(pipeline.source, LanceSource)
+    assert pipeline.source.version == version_one
+
+    lance.write_dataset(pa.table({"x": [2]}), str(dataset_uri), mode="append")
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == [1]
+
+
+def test_lance_shards_pin_version_across_independent_pipeline_payloads(
+    tmp_path,
+) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "cloud-version-pin.lance"
+    version_one = lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri)).version
+    payload = cloudpickle.dumps(load_lance(dataset_uri))
+
+    planner_pipeline = cloudpickle.loads(payload)
+    shards = planner_pipeline.list_shards()
+    assert all(
+        shard.descriptor.source_version == version_one
+        for shard in shards
+        if isinstance(shard.descriptor, RowRangeDescriptor)
+    )
+
+    lance.write_dataset(pa.table({"x": [2]}), str(dataset_uri), mode="append")
+    worker_pipeline = cloudpickle.loads(payload)
+    claimed_shard = Shard.from_dict(shards[0].to_dict())
+    worker_pipeline.source.prepare_shard(claimed_shard)
+
+    assert worker_pipeline.source.version == version_one
+    units = list(worker_pipeline.source.read_shard(claimed_shard))
+    assert [value for unit in units for value in unit.table["x"].to_pylist()] == [1]
+
+
+def test_multistage_workflow_plans_lance_input_before_it_exists(tmp_path) -> None:
+    pytest.importorskip("lance")
+    dataset_uri = tmp_path / "produced.lance"
+    produce = from_items([{"x": 1}]).write_lance_dataset(dataset_uri)
+    consume = (
+        load_lance(dataset_uri)
+        .map(lambda row: {"y": row["x"] + 1}, dtypes={"y": datatype.int64()})
+        .write_lance_dataset(
+            dataset_uri,
+            mode=AddColumns(),
+            columns=["y"],
+        )
+    )
+    workflow = produce.as_stage(name="produce").then(consume, name="consume")
+
+    stages = compile_pipeline_plan(workflow)["stages"]
+
+    assert [stage["name"] for stage in stages] == [
+        "produce",
+        "produce_finalize",
+        "consume",
+        "consume_finalize",
+    ]
+    assert stages[2]["steps"][0]["args"]["version"] is None
+
+
+def test_max_block_rows_bounds_lance_scanner_batches(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "scanner-batches.lance"
+    lance.write_dataset(pa.table({"x": list(range(9))}), str(dataset_uri))
+
+    default_pipeline = load_lance(dataset_uri)
+    bounded_pipeline = default_pipeline.with_max_block_rows(2)
+    restored_pipeline = bounded_pipeline.with_max_block_rows(None)
+    overridden_pipeline = (
+        load_lance(dataset_uri, read_batch_rows=4).with_max_block_rows(2).select("x")
+    )
+    enlarged_pipeline = load_lance(dataset_uri, read_batch_rows=131_072)
+
+    assert isinstance(default_pipeline.source, LanceSource)
+    assert isinstance(bounded_pipeline.source, LanceSource)
+    assert isinstance(restored_pipeline.source, LanceSource)
+    assert isinstance(overridden_pipeline.source, LanceSource)
+    assert isinstance(enlarged_pipeline.source, LanceSource)
+    assert default_pipeline.source._read_batch_rows == 65_536
+    assert bounded_pipeline.source._read_batch_rows == 2
+    assert restored_pipeline.source._read_batch_rows == 65_536
+    assert overridden_pipeline.source._read_batch_rows == 4
+    assert enlarged_pipeline.source._read_batch_rows == 131_072
+    assert overridden_pipeline.read_batch_rows == 4
+    assert overridden_pipeline.max_block_rows == 2
+
+    units = list(bounded_pipeline.source.read_shard(bounded_pipeline.list_shards()[0]))
+    tabular_units = []
+    for unit in units:
+        assert isinstance(unit, Tabular)
+        tabular_units.append(unit)
+    assert [unit.num_rows for unit in tabular_units] == [2, 2, 2, 2, 1]
+
+    overridden_units = list(
+        overridden_pipeline.source.read_shard(overridden_pipeline.list_shards()[0])
+    )
+    assert [
+        unit.num_rows for unit in overridden_units if isinstance(unit, Tabular)
+    ] == [
+        4,
+        4,
+        1,
+    ]
+
+
+def test_load_lance_rejects_invalid_read_batch_rows(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "invalid-read-batch.lance"
+    lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri))
+
+    with pytest.raises(ValueError, match="read_batch_rows must be > 0"):
+        load_lance(dataset_uri, read_batch_rows=0)
+
+
+def test_load_lance_max_rows_uses_limited_source_and_slices_final_batch(
+    tmp_path,
+) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "limited.lance"
+    lance.write_dataset(
+        pa.table({"x": list(range(6))}),
+        str(dataset_uri),
+        max_rows_per_file=2,
+    )
+
+    pipeline = load_lance(dataset_uri, max_rows=3)
+    shards = pipeline.list_shards()
+
+    assert len(shards) == 1
+    assert isinstance(shards[0].descriptor, ShardGroupDescriptor)
+    assert isinstance(pipeline.source, LimitedSource)
+    assert isinstance(pipeline.source.source, LanceSource)
+    assert pipeline.source.source._read_batch_rows == 3
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == [0, 1, 2]
+    assert pipeline.source.describe()["max_rows"] == 3
+
+
+def test_load_lance_large_max_rows_preserves_default_scanner_batch(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "large-limit.lance"
+    lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri))
+
+    pipeline = load_lance(dataset_uri, max_rows=1_000_000)
+
+    assert isinstance(pipeline.source, LimitedSource)
+    assert isinstance(pipeline.source.source, LanceSource)
+    assert pipeline.source.source._read_batch_rows == 65_536
+
+
+def test_load_lance_max_rows_zero_and_negative(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "zero.lance"
+    lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri))
+
+    assert load_lance(dataset_uri, max_rows=0).list_shards() == []
+    assert list(load_lance(dataset_uri, max_rows=0).iter_rows()) == []
+    with pytest.raises(ValueError, match="max_rows must be >= 0"):
+        load_lance(dataset_uri, max_rows=-1)
+
+
+def test_load_lance_max_rows_wraps_requested_fragment_plan(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "grouped-limited.lance"
+    lance.write_dataset(
+        pa.table({"x": list(range(6))}),
+        str(dataset_uri),
+        max_rows_per_file=2,
+    )
+
+    pipeline = load_lance(dataset_uri, max_rows=3, num_shards=1)
+    shards = pipeline.list_shards()
+
+    assert len(shards) == 1
+    descriptor = shards[0].descriptor
+    assert isinstance(descriptor, ShardGroupDescriptor)
+    assert len(descriptor.shards) == 1
+    assert (
+        descriptor.shards[0].descriptor.start,
+        descriptor.shards[0].descriptor.end,
+    ) == (
+        0,
+        3,
+    )
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == [0, 1, 2]
+
+
+def test_load_lance_normalizes_classic_blobs_to_references(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "blobs.lance"
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "image",
+                pa.large_binary(),
+                metadata={b"lance-encoding:blob": b"true"},
+            ),
+        ]
+    )
+    lance.write_dataset(
+        pa.Table.from_arrays(
+            [
+                pa.array([1, 2, 3]),
+                pa.array([b"first", None, b"second"], type=pa.large_binary()),
+            ],
+            schema=schema,
+        ),
+        str(dataset_uri),
+        max_rows_per_file=1,
+    )
+
+    pipeline = load_lance(dataset_uri)
+    output_schema = pipeline.output_schema()
+    rows = list(pipeline.iter_rows())
+
+    assert output_schema is not None
+    assert datatype.asset_storage(output_schema.field("image")) == "blob_reference"
+    assert read_blob(rows[0]["image"]) == b"first"
+    assert rows[1]["image"] is None
+    assert read_blob(rows[2]["image"]) == b"second"
+    assert rows[0]["image"]["path"].startswith(f"{dataset_uri}/data/")
+    assert rows[0]["image"]["offset"] == 0
+    assert rows[0]["image"]["size"] == 5
+
+
+def test_load_lance_rejects_selected_blob_v2_columns(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    if not hasattr(lance, "blob_array"):
+        pytest.skip("Lance Blob V2 is unavailable")
+    dataset_uri = tmp_path / "blobs-v2.lance"
+    lance.write_dataset(
+        pa.table({"id": [1], "image": lance.blob_array([b"image"])}),
+        str(dataset_uri),
+        data_storage_version="2.2",
+    )
+
+    with pytest.raises(ValueError, match="Lance Blob V2 columns"):
+        load_lance(dataset_uri).list_shards()
+
+    assert [
+        row["id"] for row in load_lance(dataset_uri, columns=["id"]).iter_rows()
+    ] == [1]
+
+
+def test_load_lance_groups_fragments_into_requested_shards(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "grouped.lance"
+    dataset = lance.write_dataset(
+        pa.table({"x": list(range(5))}),
+        str(dataset_uri),
+        max_rows_per_file=1,
+    )
+    fragment_count = len(dataset.get_fragments())
+
+    pipeline = load_lance(dataset_uri, num_shards=2)
+    shards = pipeline.list_shards()
+
+    assert len(shards) == 2
+    assert [shard.descriptor.end - shard.descriptor.start for shard in shards] == [
+        (fragment_count + 1) // 2,
+        fragment_count // 2,
+    ]
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == list(range(5))
+    assert len(load_lance(dataset_uri, num_shards=100).list_shards()) == fragment_count
+
+
+def test_load_lance_limits_leading_rows_across_fragments(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "limited.lance"
+    lance.write_dataset(
+        pa.table({"x": list(range(10))}),
+        str(dataset_uri),
+        max_rows_per_file=3,
+    )
+
+    pipeline = load_lance(
+        dataset_uri,
+        num_shards=2,
+        max_rows=5,
+    )
+
+    assert [int(row["x"]) for row in pipeline.iter_rows()] == list(range(5))
+    assert len(pipeline.list_shards()) == 1
+    assert isinstance(pipeline.source, LimitedSource)
+    assert isinstance(pipeline.source.source, LanceSource)
+    assert pipeline.source.describe()["max_rows"] == 5
+
+
+def test_load_lance_uses_indexed_reads_for_partial_fragment(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "indexed-limit.lance"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": list(range(6)),
+                "payload": [bytes([value]) * 1_024 for value in range(6)],
+            }
+        ),
+        str(dataset_uri),
+    )
+    fragment = dataset.get_fragments()[0]
+    take_calls: list[tuple[list[int], list[str]]] = []
+    scan_columns: list[list[str]] = []
+
+    class TrackingFragment:
+        fragment_id = fragment.fragment_id
+
+        def count_rows(self):
+            return fragment.count_rows()
+
+        def take(self, indices, columns=None):
+            take_calls.append((indices.to_pylist(), list(columns or [])))
+            return fragment.take(indices, columns=columns)
+
+        def to_batches(self, **kwargs):
+            scan_columns.append(list(kwargs.get("columns") or []))
+            return fragment.to_batches(**kwargs)
+
+    class TrackingDataset:
+        def get_fragments(self):
+            return [TrackingFragment()]
+
+    pipeline = load_lance(dataset_uri, read_batch_rows=2, max_rows=3)
+    limited_source = pipeline.source
+    assert isinstance(limited_source, LimitedSource)
+    source = limited_source.source
+    assert isinstance(source, LanceSource)
+    _ = source.schema
+    source._dataset_cache = TrackingDataset()
+
+    assert [int(row["id"]) for row in pipeline.iter_rows()] == [0, 1, 2]
+    assert take_calls == [
+        ([0, 1], ["id", "payload"]),
+        ([2], ["id", "payload"]),
+    ]
+    assert scan_columns == [[]]
+
+
+def test_load_lance_indexed_limit_preserves_deleted_row_addresses(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "deleted-limit.lance"
+    dataset = lance.write_dataset(
+        pa.table({"id": list(range(6)), "payload": [b"value"] * 6}),
+        str(dataset_uri),
+    )
+    dataset.delete("id = 1 OR id = 3")
+
+    pipeline = load_lance(dataset_uri, max_rows=3)
+    shard = pipeline.list_shards()[0]
+    units = list(pipeline.source.read_shard(shard))
+    tabular_units = [unit for unit in units if isinstance(unit, Tabular)]
+    assert len(tabular_units) == len(units)
+
+    assert [
+        int(value.as_py())
+        for unit in tabular_units
+        for value in unit.table.column("id")
+    ] == [0, 2, 4]
+    assert [
+        int(value.as_py())
+        for unit in tabular_units
+        for value in unit.table.column(SOURCE_ROW_ID_COLUMN)
+    ] == [0, 2, 4]
+
+
+def test_load_lance_indexed_limit_preserves_classic_blob_references(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "limited-blobs.lance"
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "image",
+                pa.large_binary(),
+                metadata={b"lance-encoding:blob": b"true"},
+            ),
+        ]
+    )
+    lance.write_dataset(
+        pa.Table.from_arrays(
+            [
+                pa.array([1, 2, 3]),
+                pa.array([b"first", None, b"second"], type=pa.large_binary()),
+            ],
+            schema=schema,
+        ),
+        str(dataset_uri),
+    )
+
+    rows = list(load_lance(dataset_uri, max_rows=2).iter_rows())
+
+    assert [int(row["id"]) for row in rows] == [1, 2]
+    assert read_blob(rows[0]["image"]) == b"first"
+    assert rows[1]["image"] is None
+
+
+def test_load_lance_indexed_limit_supports_empty_projection(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "empty-projection.lance"
+    lance.write_dataset(pa.table({"id": [1, 2, 3]}), str(dataset_uri))
+
+    assert [
+        row.to_dict()
+        for row in load_lance(dataset_uri, columns=[], max_rows=2).iter_rows()
+    ] == [{}, {}]
+
+
+def test_load_lance_max_rows_allows_short_dataset(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "short.lance"
+    lance.write_dataset(pa.table({"x": [1, 2]}), str(dataset_uri))
+
+    assert [
+        int(row["x"]) for row in load_lance(dataset_uri, max_rows=10).iter_rows()
+    ] == [1, 2]
+
+
+def test_limited_lance_source_rejects_add_columns(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "limited-add-columns.lance"
+    lance.write_dataset(pa.table({"x": [1, 2]}), str(dataset_uri))
+
+    with pytest.raises(ValueError, match="limited Lance source"):
+        load_lance(dataset_uri, max_rows=1).write_lance_dataset(
+            dataset_uri,
+            mode="add_columns",
+            columns=["y"],
+        )
+
+
+def test_limited_lance_source_adds_columns_with_null_fill(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "limited-add-columns-fill.lance"
+    base = lance.write_dataset(
+        pa.table({"x": list(range(8))}),
+        str(dataset_uri),
+        max_rows_per_file=3,
+    )
+
+    (
+        load_lance(dataset_uri, version=base.version, max_rows=4)
+        .map(lambda row: {"y": int(row["x"]) * 10}, dtypes={"y": datatype.int64()})
+        .write_lance_dataset(
+            dataset_uri,
+            mode=AddColumns(),
+            columns=["y"],
+        )
+        .launch_local(
+            name="limited-add-columns-fill",
+            num_workers=1,
+            rundir=str(tmp_path / "limited-add-columns-fill-run"),
+        )
+    )
+
+    assert lance.dataset(str(dataset_uri)).to_table().to_pydict() == {
+        "x": list(range(8)),
+        "y": [0, 10, 20, 30, None, None, None, None],
+    }
+
+
+def test_load_lance_uses_physical_row_addresses_as_source_row_ids(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "positions.lance"
+    lance.write_dataset(
+        pa.table({"x": [1, 2, 3]}),
+        str(dataset_uri),
+        max_rows_per_file=2,
+    )
+
+    pipeline = load_lance(dataset_uri)
+    addresses_by_shard = []
+    for shard in pipeline.list_shards():
+        addresses = []
+        for unit in pipeline.source.read_shard(shard):
+            assert isinstance(unit, Tabular)
+            addresses.extend(
+                int(value.as_py()) for value in unit.table.column(SOURCE_ROW_ID_COLUMN)
+            )
+            assert unit.table.column_names == ["x", SOURCE_ROW_ID_COLUMN]
+        addresses_by_shard.append(addresses)
+
+    assert addresses_by_shard == [[0, 1], [1 << 32]]
+
+
+def test_load_lance_hides_internal_columns_from_iter_rows(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "public-rows.lance"
+    lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri))
+
+    row = next(iter(load_lance(dataset_uri).iter_rows()))
+    output_schema = load_lance(dataset_uri).output_schema()
+
+    assert row.to_dict() == {"x": 1}
+    assert output_schema is not None
+    assert output_schema.names == ["x"]
+
+
+def test_load_lance_rejects_configured_fsspec_handle() -> None:
+    with pytest.raises(ValueError, match="configured fsspec handles"):
+        load_lance(("bucket/data.lance", MemoryFileSystem()))
+
+
+def test_load_lance_rejects_configured_fsspec_setter() -> None:
+    from refiner.io.datafolder import DataFolder
+
+    input_folder = DataFolder("bucket/data.lance")
+    input_folder.fs = MemoryFileSystem()
+
+    with pytest.raises(ValueError, match="configured fsspec handles"):
+        load_lance(input_folder)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://user:password@bucket/dataset.lance",
+        "s3://bucket/data.lance?token=x",
+        "s3://bucket/data.lance#token=x",
+    ],
+)
+def test_load_lance_rejects_secret_bearing_uri(uri: str) -> None:
+    with pytest.raises(ValueError, match="must not contain credentials"):
+        load_lance(uri)
+
+
+def test_load_lance_rejects_reserved_shard_id_column(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "reserved-shard-id.lance"
+    lance.write_dataset(
+        pa.table({"__shard_id": ["user-value"], "x": [1]}), str(dataset_uri)
+    )
+
+    with pytest.raises(ValueError, match="reserved column __shard_id"):
+        load_lance(dataset_uri).list_shards()
+
+
+def test_load_lance_cache_does_not_cross_source_instances(tmp_path) -> None:
+    lance = pytest.importorskip("lance")
+    dataset_uri = tmp_path / "recreated.lance"
+    old_uri = tmp_path / "old-recreated.lance"
+    lance.write_dataset(pa.table({"x": [1]}), str(dataset_uri))
+    first = load_lance(dataset_uri)
+    assert [int(row["x"]) for row in first.iter_rows()] == [1]
+
+    dataset_uri.rename(old_uri)
+    lance.write_dataset(pa.table({"x": [2]}), str(dataset_uri))
+    second = load_lance(dataset_uri)
+
+    assert [int(row["x"]) for row in second.iter_rows()] == [2]

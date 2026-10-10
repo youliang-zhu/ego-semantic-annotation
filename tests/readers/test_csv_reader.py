@@ -1,0 +1,140 @@
+import pytest
+
+from refiner.pipeline.data import datatype
+from refiner.pipeline.data.shard import FilePartsDescriptor
+from refiner.pipeline.data.tabular import Tabular
+from refiner.pipeline.sources.readers import CsvReader
+
+
+def _rows_from_shard_units(units):
+    for unit in units:
+        if isinstance(unit, Tabular):
+            yield from unit.to_rows()
+        else:
+            yield unit
+
+
+def test_csv_bytes_lazy_reads_all_rows_exactly_once(tmp_path):
+    p = tmp_path / "data.csv"
+    # Make this file large enough to exceed the min shard size clamp (16MiB) so we get >1 shard.
+    n = 2500
+    payload = "x" * 8192
+    with p.open("wt") as f:
+        f.write("id,val\n")
+        for i in range(n):
+            f.write(f"{i},{payload}\n")
+
+    r = CsvReader(str(p), target_shard_bytes=16 * 1024 * 1024)
+    shards = r.list_shards()
+    assert len(shards) > 1
+
+    ids = set()
+    count = 0
+    for s in shards:
+        for row in _rows_from_shard_units(r.read_shard(s)):
+            ids.add(int(row["id"]))
+            count += 1
+
+    assert count == n
+    assert ids == set(range(n))
+
+
+def test_csv_automatic_shard_planning_caps_without_dropping_bytes(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_bytes(b"x" * 1001)
+
+    shards = CsvReader(str(path), target_shard_bytes=1).list_shards()
+
+    assert len(shards) == 1000
+    descriptors = [shard.descriptor for shard in shards]
+    assert all(
+        isinstance(descriptor, FilePartsDescriptor) for descriptor in descriptors
+    )
+    assert (
+        sum(
+            part.end - part.start
+            for descriptor in descriptors
+            if isinstance(descriptor, FilePartsDescriptor)
+            for part in descriptor.parts
+        )
+        == path.stat().st_size
+    )
+
+
+def test_csv_rejects_explicit_shard_count_above_limit(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("id\n1\n")
+
+    with pytest.raises(ValueError, match=r"num_shards must be <= 10,000"):
+        CsvReader(str(path), num_shards=10_001)
+
+
+def test_csv_automatic_shard_planning_caps_atomic_files(tmp_path):
+    for index in range(1001):
+        (tmp_path / f"{index}.csv").write_bytes(b"xx")
+
+    shards = CsvReader(
+        str(tmp_path), target_shard_bytes=3, multiline_rows=True
+    ).list_shards()
+
+    assert len(shards) == 1000
+    assert (
+        sum(
+            len(descriptor.parts)
+            for shard in shards
+            if isinstance((descriptor := shard.descriptor), FilePartsDescriptor)
+        )
+        == 1001
+    )
+
+
+def test_csv_multiline_reads_embedded_newline(tmp_path):
+    p = tmp_path / "multi.csv"
+    # second row contains an embedded newline in a quoted field
+    p.write_text('id,text\n0,"hello\nworld"\n1,"ok"\n')
+
+    r = CsvReader(str(p), target_shard_bytes=8, multiline_rows=True)
+    shards = r.list_shards()
+    assert len(shards) >= 1
+
+    rows = []
+    for s in shards:
+        rows.extend(list(_rows_from_shard_units(r.read_shard(s))))
+
+    assert len(rows) == 2
+    assert rows[0]["id"] == "0"
+    assert rows[0]["text"] == "hello\nworld"
+    assert rows[1]["id"] == "1"
+    assert rows[1]["text"] == "ok"
+
+
+def test_csv_can_enable_arrow_parse_threads(tmp_path):
+    p = tmp_path / "data.csv"
+    p.write_text("id,val\n0,a\n1,b\n")
+
+    reader = CsvReader(str(p), parse_use_threads=True)
+    rows = []
+    for shard in reader.list_shards():
+        rows.extend(list(_rows_from_shard_units(reader.read_shard(shard))))
+
+    assert [str(row["id"]) for row in rows] == ["0", "1"]
+
+
+def test_csv_reader_applies_dtypes_to_arrow_and_python_paths(tmp_path):
+    p = tmp_path / "data.csv"
+    p.write_text("id,video\n0,clip.mp4\n")
+
+    arrow_reader = CsvReader(str(p), dtypes={"video": datatype.video_path()})
+    arrow_unit = next(iter(arrow_reader.read_shard(arrow_reader.list_shards()[0])))
+    assert isinstance(arrow_unit, Tabular)
+    assert arrow_unit.table.schema.field("video").metadata == {b"asset_type": b"video"}
+
+    python_reader = CsvReader(
+        str(p),
+        multiline_rows=True,
+        dtypes={"video": datatype.video_path()},
+    )
+    python_row = next(iter(python_reader.read_shard(python_reader.list_shards()[0])))
+    assert not hasattr(python_row, "schema")
+    assert python_reader.schema is not None
+    assert python_reader.schema.field("video").metadata == {b"asset_type": b"video"}

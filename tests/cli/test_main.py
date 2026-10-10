@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+from refiner.cli.main import build_parser, main
+
+
+def test_parser_has_auth_commands() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["whoami"])
+    assert args.command == "whoami"
+
+
+def test_parser_has_debug_commands() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["debug", "exec", "pipeline.py", "--", "python", "-V"])
+    assert args.command == "debug"
+    assert args.debug_args == ["exec", "pipeline.py", "--", "python", "-V"]
+
+    create_args = parser.parse_args(["debug", "pipeline.py"])
+    assert create_args.debug_args == ["pipeline.py"]
+
+
+def test_parser_has_run_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "run",
+            "--attach",
+            "--logs",
+            "one",
+            "script.py",
+            "--",
+            "--rows",
+            "10",
+        ]
+    )
+    assert args.command == "run"
+    assert args.attach is True
+    assert args.detach is False
+    assert args.logs == "one"
+    assert args.script == "script.py"
+    assert args.script_args == ["--rows", "10"]
+
+
+def test_run_help_does_not_import_pipeline_package() -> None:
+    src_path = Path(__file__).resolve().parents[2] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(src_path), env.get("PYTHONPATH", "")) if part
+    )
+    code = """
+import sys
+from refiner.cli.main import build_parser
+
+parser = build_parser()
+try:
+    parser.parse_args(["run", "--help"])
+except SystemExit as exc:
+    if exc.code != 0:
+        raise
+
+print("IMPORTED_PIPELINE", "refiner.pipeline" in sys.modules)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        check=True,
+        env=env,
+        text=True,
+    )
+
+    assert "IMPORTED_PIPELINE False" in result.stdout
+
+
+def test_parser_has_run_detach_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["run", "--detach", "script.py"])
+    assert args.command == "run"
+    assert args.attach is False
+    assert args.detach is True
+    assert args.script == "script.py"
+
+
+def test_parser_has_jobs_commands() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "list", "--kind", "cloud", "--me"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "list"
+    assert args.kind == "cloud"
+    assert args.me is True
+
+
+def test_parser_has_secrets_commands() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["secrets", "set", "HF_TOKEN", "--env", "production"])
+    assert args.command == "secrets"
+    assert args.secrets_command == "set"
+    assert args.name == "HF_TOKEN"
+    assert args.env == "production"
+
+
+def test_parser_has_jobs_logs_follow_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "logs", "job-1", "--follow"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "logs"
+    assert args.job_id == "job-1"
+    assert args.follow is True
+
+
+def test_parser_has_jobs_logs_cursor_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "logs", "job-1", "--cursor", "cursor-1"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "logs"
+    assert args.job_id == "job-1"
+    assert args.cursor == "cursor-1"
+
+
+def test_parser_has_jobs_cancel_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "cancel", "job-1"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "cancel"
+    assert args.job_id == "job-1"
+
+
+def test_parser_has_manifest_flags() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "manifest", "job-1", "--deps", "--code"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "manifest"
+    assert args.job_id == "job-1"
+    assert args.deps is True
+    assert args.code is True
+
+
+def test_parser_has_jobs_attach_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["jobs", "attach", "job-1"])
+    assert args.command == "jobs"
+    assert args.jobs_command == "attach"
+    assert args.job_id == "job-1"
+
+
+def test_parser_has_jobs_workers_pagination_flags() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["jobs", "workers", "job-1", "--limit", "50", "--cursor", "20"]
+    )
+    assert args.command == "jobs"
+    assert args.jobs_command == "workers"
+    assert args.job_id == "job-1"
+    assert args.limit == 50
+    assert args.cursor == "20"
+
+
+def test_parser_has_stage_metrics_commands() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["jobs", "metrics", "job-1", "2", "--step", "3", "--metric", "rows"]
+    )
+    assert args.command == "jobs"
+    assert args.jobs_command == "metrics"
+    assert args.job_id == "job-1"
+    assert args.stage_index == 2
+    assert args.step == 3
+    assert args.metric == ["rows"]
+
+
+def test_parser_has_stage_metrics_worker_flags() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "jobs",
+            "metrics",
+            "job-1",
+            "2",
+            "--step",
+            "3",
+            "--metric",
+            "rows",
+            "--workers",
+            "--worker",
+            "worker-1",
+            "--asc",
+        ]
+    )
+    assert args.command == "jobs"
+    assert args.jobs_command == "metrics"
+    assert args.workers is True
+    assert args.worker == ["worker-1"]
+    assert args.asc is True
+    assert args.desc is False
+
+
+def test_parser_has_resource_metrics_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["jobs", "resource-metrics", "job-1", "2", "--worker-id", "worker-1"]
+    )
+    assert args.command == "jobs"
+    assert args.jobs_command == "resource-metrics"
+    assert args.job_id == "job-1"
+    assert args.stage_index == 2
+    assert args.worker_id == ["worker-1"]
+
+
+def test_main_dispatches(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "refiner.cli.main.importlib.import_module",
+        lambda module_name: SimpleNamespace(cmd_whoami=lambda args: 7),
+    )
+    rc = main(["whoami"])
+    assert rc == 7
+
+
+def test_main_returns_interrupt_exit_for_unhandled_keyboard_interrupt(
+    monkeypatch, capsys
+) -> None:
+    def interrupt(args):
+        del args
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "refiner.cli.main.importlib.import_module",
+        lambda module_name: SimpleNamespace(cmd_whoami=interrupt),
+    )
+
+    rc = main(["whoami"])
+
+    out = capsys.readouterr()
+    assert rc == 130
+    assert out.err == "Interrupted.\n"
+    assert "Traceback" not in out.err
+
+
+def test_main_prints_keyboard_interrupt_message(monkeypatch, capsys) -> None:
+    def interrupt(args):
+        del args
+        raise KeyboardInterrupt("Local job interrupted.")
+
+    monkeypatch.setattr(
+        "refiner.cli.main.importlib.import_module",
+        lambda module_name: SimpleNamespace(cmd_whoami=interrupt),
+    )
+
+    rc = main(["whoami"])
+
+    out = capsys.readouterr()
+    assert rc == 130
+    assert out.err == "Local job interrupted.\n"
+    assert "Traceback" not in out.err
+
+
+def test_main_no_args_shows_help(capsys) -> None:
+    rc = main([])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "Macrodata CLI" in out.out
+
+
+def test_main_jobs_without_subcommand_shows_jobs_help(capsys) -> None:
+    rc = main(["jobs"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "usage: macrodata jobs" in out.out

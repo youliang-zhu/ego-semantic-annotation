@@ -1,0 +1,185 @@
+---
+title: "Lance"
+description: "Write Lance files, datasets, and distributed schema evolution results"
+---
+
+# Lance
+
+Lance support is optional:
+
+```bash
+pip install macrodata-refiner[lance]
+```
+
+## Standalone files
+
+Use `write_lance(...)` to create one independent Lance file per finalized
+Refiner shard:
+
+```python
+import refiner as mdr
+
+pipeline = (
+    mdr.read_parquet("s3://my-bucket/raw/*.parquet")
+    .write_lance("s3://my-bucket/lance-files/")
+)
+```
+
+## Lance datasets
+
+Use `write_lance_dataset(...)` for committed Lance datasets:
+
+```python
+pipeline = (
+    mdr.read_parquet("s3://my-bucket/raw/*.parquet")
+    .write_lance_dataset("s3://my-bucket/clean.lance", mode=mdr.Create())
+)
+```
+
+Asset output uses the same format-independent configurations as Parquet and
+JSONL. Individual files use `FileAssetConfig`; packed block files use
+`BlobAssetConfig` and are stored as `{path, offset, size}` columns:
+
+```python
+pipeline.write_lance_dataset(
+    "s3://my-bucket/clean.lance",
+    assets=mdr.BlobAssetConfig(target_bytes=1 << 30),
+)
+```
+
+Here `1 << 30` selects a 1 GiB target block size. Refiner does not create
+Lance-native blob columns when writing; it writes generic block files and typed
+`{path, offset, size}` references that can be read with `mdr.read_blob(...)`.
+
+Supported modes are `Create()`, `Overwrite()`, `Append()`, and `AddColumns()`.
+The legacy strings remain accepted for backward compatibility.
+Empty `Create()` and `Overwrite()` jobs fail explicitly. Empty `Append()` jobs
+are no-ops.
+
+Lance opens dataset URIs through its native storage layer. Configured fsspec
+filesystem objects and `storage_options` are therefore rejected instead of
+being silently ignored. Configure the endpoint and credentials through
+provider-standard environment settings recognized by both Lance and fsspec;
+the dataset writer uses Lance for fragments and fsspec for attempt handoff
+metadata. Credential-bearing URIs and URI query parameters are rejected so
+pipeline plans do not serialize secrets.
+
+Refiner coalesces small pipeline blocks into approximately 256 MiB Arrow
+batches before handing them to Lance. This is the default for efficient
+object-store writes. For unusual memory budgets, configure both the target and
+the per-shard logical Arrow buffer limit:
+
+```python
+pipeline.write_lance_dataset(
+    "s3://my-bucket/clean.lance",
+    io=mdr.LanceIOConfig(
+        upload_concurrency=32,
+        multipart_part_bytes=5 * 1024 * 1024,
+        target_batch_bytes=256 * 1024 * 1024,
+        max_buffered_bytes=1024 * 1024 * 1024,
+    ),
+)
+```
+
+The buffer limit must be at least four times the target to cover one batch in
+Lance, one queued batch, rows being accumulated, and the transient coalesced
+batch. A single row larger than the target is necessarily written alone.
+The target must also contain at least one part per upload slot. Upload
+concurrency and part size are process-wide Lance settings; a retained worker
+must be restarted before using different values.
+
+## Adding columns
+
+Use `AddColumns()` for row-preserving enrichment such as model inference:
+
+```python
+pipeline = (
+    mdr.load_lance(
+        "s3://my-bucket/hands.lance",
+        version=42,
+        columns=["image"],
+    )
+    .map(
+        detect_hands,
+        dtypes={
+            "hand_boxes": mdr.datatype.list(mdr.datatype.float32()),
+            "detector_score": mdr.datatype.float32(),
+        },
+    )
+    .write_lance_dataset(
+        "s3://my-bucket/hands.lance",
+        mode=mdr.AddColumns(),
+        columns=["hand_boxes", "detector_score"],
+    )
+)
+```
+
+New asset columns can use either output layout in the same operation:
+
+```python
+pipeline.write_lance_dataset(
+    "s3://my-bucket/hands.lance",
+    mode=mdr.AddColumns(),
+    columns=["crop"],
+    assets=mdr.BlobAssetConfig(target_bytes=1 << 30),
+)
+```
+
+The `columns` argument is required and only those columns are written. Omitted
+results are filled with null by default. The legacy string
+`mode="add_columns"` retains its strict behavior and fails if any result is
+missing.
+
+In an ordered workflow, `load_lance(...)` and `AddColumns()` may target a
+dataset created by an earlier stage. Leave `version` unset and Refiner pins the
+source version when the add-columns stage starts.
+
+Every finalized shard emits coordination metadata, including shards that
+produce no rows. The reducer requires complete metadata coverage before it
+commits, so a missing worker result fails explicitly instead of silently
+omitting rows.
+
+Source row identity is carried in the hidden `__source_row_id` execution column,
+alongside `__shard_id`. Ordinary readers receive a shard-local row ordinal;
+Lance supplies its physical row address so `add_columns` can restore
+fragment-local order after asynchronous or batched transforms. Both columns are
+removed before user data is persisted.
+
+### Filling omitted rows
+
+Use `AddColumns` when inference should run on only part of the source while the
+new columns still need to align with every row in the existing dataset:
+
+```python
+pipeline = (
+    mdr.load_lance(
+        "s3://my-bucket/hands.lance",
+        columns=["image"],
+        max_rows=200_000,
+    )
+    .map(
+        embed_hand,
+        dtypes={"embedding": mdr.datatype.list(mdr.datatype.float32())},
+    )
+    .write_lance_dataset(
+        "s3://my-bucket/hands.lance",
+        mode=mdr.AddColumns(),
+        columns=["embedding"],
+    )
+)
+```
+
+Processed rows receive their computed values. Omitted rows receive null. Supply
+a mapping to use per-column defaults instead:
+
+```python
+mode=mdr.AddColumns(fill={"embedding": None, "status": "not_processed"})
+```
+
+## Internal Notes
+
+Lance drains multipart uploads at input-batch boundaries. Byte-aware
+coalescing gives each boundary enough data to use the configured upload
+concurrency without requiring an upstream Lance change. The buffer calculation
+covers one batch in Lance, one or more queued batches, rows being accumulated,
+and the transient Arrow concatenation.

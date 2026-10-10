@@ -1,0 +1,744 @@
+from __future__ import annotations
+
+import importlib.metadata
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, TypeVar
+from urllib.parse import quote, urlencode
+
+import httpx
+import msgspec
+
+from refiner.platform.auth import MacrodataCredentialsError, current_api_key
+from refiner.platform.client.models import (
+    CloudFileCompleteRequestItem,
+    CloudFileCompleteResponse,
+    CloudFileUploadInstruction,
+    CloudFileUploadRequestItem,
+    CloudFileUploadUrlsResponse,
+    CloudRunCreateRequest,
+    CloudRunCreateResponse,
+    CreateJobEnvelope,
+    CreateJobResponse,
+    StageLifecycleResponse,
+    VerifyApiKeyResponse,
+)
+
+T = TypeVar("T")
+PLATFORM_BASE_URL_ENV_VAR = "MACRODATA_BASE_URL"
+_PLATFORM_BASE_URL = "https://macrodata.co"
+
+try:
+    _REFINER_VERSION = importlib.metadata.version("macrodata-refiner").strip()
+except importlib.metadata.PackageNotFoundError:
+    _REFINER_VERSION = ""
+
+_USER_AGENT = (
+    f"macrodata-refiner/{_REFINER_VERSION}" if _REFINER_VERSION else "macrodata-refiner"
+)
+LIFECYCLE_REQUEST_ATTEMPTS = 4
+LIFECYCLE_RETRY_INITIAL_DELAY_S = 0.25
+
+
+def sanitize_terminal_text(value: str) -> str:
+    return "".join(ch for ch in value if " " <= ch < "\x7f" or ch >= "\xa0")
+
+
+def _query_param_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return [_query_param_value(item) for item in value]
+    return value
+
+
+def resolve_platform_base_url() -> str:
+    env_value = os.environ.get(PLATFORM_BASE_URL_ENV_VAR)
+    if env_value:
+        return env_value.rstrip("/")
+    return _PLATFORM_BASE_URL
+
+
+@dataclass
+class MacrodataApiError(Exception):
+    status: int
+    message: str
+    url: str | None = None
+
+    def __str__(self) -> str:
+        error = f"HTTP {self.status}: {self.message}"
+        return (
+            f"{error} (url: {sanitize_terminal_text(self.url)})" if self.url else error
+        )
+
+
+def _decode_json_object(
+    resp: httpx.Response, *, context: str, url: str | None = None
+) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+    except ValueError as err:
+        raise MacrodataApiError(
+            status=resp.status_code,
+            message=f"Invalid JSON from {context}",
+            url=url,
+        ) from err
+    if not isinstance(payload, dict):
+        raise MacrodataApiError(
+            status=resp.status_code,
+            message=f"Unexpected response from {context}",
+            url=url,
+        )
+    return payload
+
+
+def _http_error_message(resp: httpx.Response) -> str:
+    try:
+        payload = resp.json()
+    except ValueError:
+        content_type = resp.headers.get("content-type", "").lower()
+        text = resp.text.strip()
+        if "html" in content_type:
+            return sanitize_terminal_text(resp.reason_phrase or "HTTP error")
+        if not text:
+            return sanitize_terminal_text(resp.reason_phrase or "HTTP error")
+        one_line = " ".join(text.split())
+        if len(one_line) > 200:
+            one_line = f"{one_line[:197]}..."
+        return sanitize_terminal_text(one_line)
+    if isinstance(payload, dict):
+        message = payload.get("error") or payload.get("message")
+        if isinstance(message, str) and message:
+            return sanitize_terminal_text(message)
+    return sanitize_terminal_text(resp.reason_phrase or "HTTP error")
+
+
+def request_json(
+    *,
+    method: str,
+    path: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    http_client: httpx.Client | None = None,
+    json_payload: dict[str, Any] | None = None,
+    timeout_s: float = 10.0,
+) -> dict[str, Any]:
+    resolved_base_url = resolve_platform_base_url() if base_url is None else base_url
+    url = f"{resolved_base_url.rstrip('/')}{path}"
+    try:
+        if http_client is not None:
+            resp = http_client.request(
+                method,
+                url,
+                json=json_payload,
+                timeout=timeout_s,
+            )
+        else:
+            headers = {"User-Agent": _USER_AGENT}
+            if api_key is not None and api_key.strip():
+                headers["Authorization"] = f"Bearer {api_key}"
+            resp = httpx.request(
+                method,
+                url,
+                headers=headers,
+                json=json_payload,
+                timeout=timeout_s,
+            )
+    except httpx.RequestError as err:
+        raise MacrodataApiError(status=0, message=str(err), url=url) from err
+
+    if resp.is_error:
+        if resp.status_code == 401:
+            raise MacrodataCredentialsError(
+                _http_error_message(resp),
+                missing=False,
+            )
+        raise MacrodataApiError(
+            status=resp.status_code,
+            message=_http_error_message(resp),
+            url=url,
+        )
+
+    return _decode_json_object(resp, context=path, url=url)
+
+
+def verify_api_key(
+    *,
+    api_key: str,
+    base_url: str | None = None,
+    timeout_s: float = 10.0,
+) -> VerifyApiKeyResponse:
+    return MacrodataClient(api_key=api_key, base_url=base_url).verify_api_key(
+        timeout_s=timeout_s
+    )
+
+
+class MacrodataClient:
+    def __init__(self, *, api_key: str | None = None, base_url: str | None = None):
+        self.api_key = api_key if api_key is not None else current_api_key()
+        self.base_url = (base_url or resolve_platform_base_url()).rstrip("/")
+        headers = {"User-Agent": _USER_AGENT}
+        if self.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        self._http_client = httpx.Client(headers=headers)
+
+    def close(self) -> None:
+        self._http_client.close()
+
+    def __del__(self) -> None:  # pragma: no cover
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _request_raw(
+        self,
+        *,
+        method: str,
+        path: str,
+        query_params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        timeout_s: float = 10.0,
+        retry_attempts: int = LIFECYCLE_REQUEST_ATTEMPTS,
+        retry_initial_delay_s: float = LIFECYCLE_RETRY_INITIAL_DELAY_S,
+    ) -> dict[str, Any]:
+        resolved_path = path
+        if query_params:
+            filtered_params = {
+                key: _query_param_value(value)
+                for key, value in query_params.items()
+                if value is not None and value != [] and value != ""
+            }
+            if filtered_params:
+                encoded = urlencode(filtered_params, doseq=True)
+                resolved_path = f"{path}?{encoded}"
+        attempts = max(1, retry_attempts)
+        for attempt_index in range(attempts):
+            try:
+                return request_json(
+                    method=method,
+                    path=resolved_path,
+                    base_url=self.base_url,
+                    http_client=self._http_client,
+                    json_payload=json_payload,
+                    timeout_s=timeout_s,
+                )
+            except MacrodataApiError as err:
+                if attempt_index == attempts - 1 or not (
+                    err.status == 0
+                    or err.status in {408, 425, 429}
+                    or err.status >= 500
+                ):
+                    raise
+                time.sleep(retry_initial_delay_s * (2**attempt_index))
+        raise AssertionError("unreachable lifecycle request retry state")
+
+    def _request(
+        self,
+        *,
+        method: str,
+        path: str,
+        response_type: type[T],
+        query_params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        timeout_s: float = 10.0,
+        retry_attempts: int = LIFECYCLE_REQUEST_ATTEMPTS,
+        retry_initial_delay_s: float = LIFECYCLE_RETRY_INITIAL_DELAY_S,
+    ) -> T:
+        response_data = self._request_raw(
+            method=method,
+            path=path,
+            query_params=query_params,
+            json_payload=json_payload,
+            timeout_s=timeout_s,
+            retry_attempts=retry_attempts,
+            retry_initial_delay_s=retry_initial_delay_s,
+        )
+        try:
+            return msgspec.convert(response_data, type=response_type, strict=True)
+        except (TypeError, msgspec.ValidationError) as err:
+            raise MacrodataApiError(status=200, message=str(err)) from err
+
+    def create_job(
+        self,
+        *,
+        name: str,
+        plan: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> CreateJobResponse:
+        request_body = {
+            "name": name,
+            "plan": plan,
+            "manifest": manifest,
+        }
+        job_envelope = self._request(
+            method="POST",
+            path="/api/jobs/submit",
+            response_type=CreateJobEnvelope,
+            json_payload=request_body,
+            timeout_s=30.0,
+        )
+        return CreateJobResponse.from_envelope(job_envelope)
+
+    def verify_api_key(self, *, timeout_s: float = 10.0) -> VerifyApiKeyResponse:
+        return self._request(
+            method="GET",
+            path="/api/me",
+            response_type=VerifyApiKeyResponse,
+            timeout_s=timeout_s,
+        )
+
+    def report_stage_started(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+    ) -> StageLifecycleResponse:
+        return self._request(
+            method="POST",
+            path=f"/api/jobs/{job_id}/stages/{stage_index}/start",
+            response_type=StageLifecycleResponse,
+        )
+
+    def report_stage_finished(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+        status: str,
+        reason: str | None = None,
+    ) -> StageLifecycleResponse:
+        payload: dict[str, Any] = {"status": status}
+        if reason and reason.strip():
+            payload["reason"] = reason.strip()
+        return self._request(
+            method="POST",
+            path=f"/api/jobs/{job_id}/stages/{stage_index}/finish",
+            response_type=StageLifecycleResponse,
+            json_payload=payload,
+        )
+
+    def report_stage_heartbeat(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+    ) -> StageLifecycleResponse:
+        return self._request(
+            method="POST",
+            path=f"/api/jobs/{job_id}/stages/{stage_index}/heartbeat",
+            response_type=StageLifecycleResponse,
+            json_payload={},
+        )
+
+    def cloud_submit_job(
+        self, *, request: CloudRunCreateRequest
+    ) -> CloudRunCreateResponse:
+        return self._request(
+            method="POST",
+            path="/api/cloud/runs",
+            response_type=CloudRunCreateResponse,
+            json_payload=request.to_dict(),
+            timeout_s=30.0,
+        )
+
+    def cloud_create_file_upload_urls(
+        self,
+        *,
+        files: list[CloudFileUploadRequestItem],
+        object_ttl_secs: int | None = None,
+    ) -> CloudFileUploadUrlsResponse:
+        return self._request(
+            method="POST",
+            path="/api/cloud/files/upload-urls",
+            response_type=CloudFileUploadUrlsResponse,
+            json_payload={
+                "files": [file.to_dict() for file in files],
+                "object_ttl_secs": object_ttl_secs,
+            },
+            timeout_s=30.0,
+        )
+
+    def cloud_upload_file(
+        self,
+        *,
+        instruction: CloudFileUploadInstruction,
+        payload_bytes: bytes,
+        timeout_s: float = 300.0,
+    ) -> None:
+        try:
+            upload_target = instruction.upload_target()
+        except ValueError as err:
+            raise MacrodataApiError(status=0, message=str(err)) from err
+        if upload_target is None:
+            return
+        url, required_headers = upload_target
+        try:
+            response = httpx.request(
+                method="PUT",
+                url=url,
+                headers=required_headers,
+                content=payload_bytes,
+                timeout=timeout_s,
+            )
+        except httpx.RequestError as err:
+            raise MacrodataApiError(status=0, message=str(err)) from err
+        if response.status_code < 200 or response.status_code >= 300:
+            raise MacrodataApiError(
+                status=response.status_code,
+                message=f"Failed to upload cloud file: {_http_error_message(response)}",
+            )
+
+    def cloud_complete_files(
+        self,
+        *,
+        files: list[CloudFileCompleteRequestItem],
+        object_ttl_secs: int | None = None,
+    ) -> CloudFileCompleteResponse:
+        return self._request(
+            method="POST",
+            path="/api/cloud/files/complete",
+            response_type=CloudFileCompleteResponse,
+            json_payload={
+                "files": [file.to_dict() for file in files],
+                "object_ttl_secs": object_ttl_secs,
+            },
+            timeout_s=30.0,
+        )
+
+    def cloud_debug_status(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/status",
+        )
+
+    def cloud_debug_exec(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str | None = None,
+        command: list[str],
+        workdir: str | None = None,
+        timeout_secs: int = 300,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "command": command,
+            "timeout_secs": timeout_secs,
+        }
+        if workdir is not None:
+            payload["workdir"] = workdir
+        attempt_id = str(uuid.UUID(attempt_id)) if attempt_id else str(uuid.uuid4())
+        payload["attempt_id"] = attempt_id
+        result = self._request_raw(
+            method="POST",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/exec",
+            json_payload=payload,
+            timeout_s=40.0,
+            retry_attempts=4,
+        )
+        return self._wait_debug_attempt(job_id, attempt_id, result, timeout_secs)
+
+    def cloud_debug_run(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str | None = None,
+        max_shards: int | None = None,
+        timeout_secs: int = 3600,
+        profile: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"timeout_secs": timeout_secs}
+        if max_shards is not None:
+            payload["max_shards"] = max_shards
+        if profile:
+            payload["profile"] = True
+        attempt_id = str(uuid.UUID(attempt_id)) if attempt_id else str(uuid.uuid4())
+        payload["attempt_id"] = attempt_id
+        result = self._request_raw(
+            method="POST",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/run",
+            json_payload=payload,
+            timeout_s=40.0,
+            retry_attempts=4,
+        )
+        return self._wait_debug_attempt(job_id, attempt_id, result, timeout_secs)
+
+    def cloud_debug_attempt(self, *, job_id: str, attempt_id: str) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/attempts/{quote(attempt_id, safe='')}",
+            timeout_s=40.0,
+        )
+
+    def _wait_debug_attempt(
+        self, job_id: str, attempt_id: str, result: dict[str, Any], timeout_secs: int
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_secs + 60
+        while result.get("status") == "running":
+            if time.monotonic() >= deadline:
+                raise MacrodataApiError(
+                    status=408,
+                    message=f"Timed out waiting for debug attempt {attempt_id}; resume using the same attempt ID",
+                )
+            time.sleep(1)
+            result = self.cloud_debug_attempt(job_id=job_id, attempt_id=attempt_id)
+        if result.get("status") not in {"completed", "failed"}:
+            raise MacrodataApiError(status=502, message="Invalid debug attempt result")
+        return result
+
+    def cloud_debug_profile(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/profile",
+            timeout_s=60.0,
+        )
+
+    def cloud_debug_stop(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(
+            method="POST",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/stop",
+            json_payload={},
+            timeout_s=60.0,
+        )
+
+    def cloud_debug_doctor(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cloud/debug/{quote(job_id, safe='')}/doctor",
+            timeout_s=60.0,
+        )
+
+    def cloud_debug_sync(
+        self,
+        *,
+        job_id: str,
+        bundle: bytes,
+        sha256: str,
+        allocation_fingerprint: str,
+    ) -> dict[str, Any]:
+        path = f"/api/cloud/debug/{quote(job_id, safe='')}/sync"
+        url = f"{self.base_url}{path}"
+        try:
+            response = self._http_client.post(
+                url,
+                params={
+                    "sha256": sha256,
+                    "allocation_fingerprint": allocation_fingerprint,
+                },
+                headers={"content-type": "application/x-tar"},
+                content=bundle,
+                timeout=300.0,
+            )
+        except httpx.RequestError as err:
+            raise MacrodataApiError(status=0, message=str(err), url=url) from err
+        if response.is_error:
+            raise MacrodataApiError(
+                status=response.status_code,
+                message=_http_error_message(response),
+                url=url,
+            )
+        return _decode_json_object(response, context=path, url=url)
+
+    def cli_list_jobs(
+        self,
+        *,
+        status: str | None = None,
+        executor_kind: str | None = None,
+        me: bool | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path="/api/cli/jobs",
+            query_params={
+                "status": status,
+                "executorKind": executor_kind,
+                "me": True if me else None,
+                "limit": limit,
+                "cursor": cursor,
+            },
+        )
+
+    def cli_get_job(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(method="GET", path=f"/api/cli/jobs/{job_id}")
+
+    def cli_get_job_manifest(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(method="GET", path=f"/api/cli/jobs/{job_id}/manifest")
+
+    def cli_get_job_workers(
+        self,
+        *,
+        job_id: str,
+        stage_index: int | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cli/jobs/{job_id}/workers",
+            query_params={
+                "stageIndex": stage_index,
+                "limit": limit,
+                "cursor": cursor,
+            },
+        )
+
+    def cli_get_job_logs(
+        self,
+        *,
+        job_id: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        anchor: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+        stage_index: int | None = None,
+        worker_id: str | None = None,
+        source_type: str | None = None,
+        source_name: str | None = None,
+        severity: str | None = None,
+        search: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cli/jobs/{job_id}/logs",
+            query_params={
+                "startMs": start_ms,
+                "endMs": end_ms,
+                "anchor": anchor,
+                "cursor": cursor,
+                "limit": limit,
+                "stageIndex": stage_index,
+                "workerId": worker_id,
+                "sourceType": source_type,
+                "sourceName": source_name,
+                "severity": severity,
+                "search": search,
+            },
+            timeout_s=30.0,
+        )
+
+    def cli_get_job_metrics(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+        range_value: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        bucket_count: int | None = None,
+        worker_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cli/jobs/{job_id}/stages/{stage_index}/resource-metrics",
+            query_params={
+                "range": range_value,
+                "startMs": start_ms,
+                "endMs": end_ms,
+                "bucketCount": bucket_count,
+                "workerIds": worker_ids,
+            },
+            timeout_s=30.0,
+        )
+
+    def cli_get_job_step_metrics(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+        step_index: int | None = None,
+        metric_labels: list[str] | None = None,
+        workers: bool | None = None,
+        worker_ids: list[str] | None = None,
+        sort: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path=f"/api/cli/jobs/{job_id}/stages/{stage_index}/metrics",
+            query_params={
+                "stepIndex": step_index,
+                "metricLabels": ",".join(metric_labels) if metric_labels else None,
+                "workers": workers,
+                "workerIds": worker_ids,
+                "sort": sort,
+            },
+            timeout_s=30.0,
+        )
+
+    def cli_cancel_job(self, *, job_id: str) -> dict[str, Any]:
+        return self._request_raw(method="POST", path=f"/api/cli/jobs/{job_id}/cancel")
+
+    def cli_list_secrets(self, *, env: str | None = None) -> dict[str, Any]:
+        return self._request_raw(
+            method="GET",
+            path="/api/cli/secrets",
+            query_params={"env": env},
+        )
+
+    def cli_set_secret(
+        self, *, name: str, value: str, env: str = "default"
+    ) -> dict[str, Any]:
+        return self._request_raw(
+            method="POST",
+            path="/api/cli/secrets",
+            json_payload={"env": env, "name": name, "value": value},
+        )
+
+    def cli_delete_secret(self, *, name: str, env: str = "default") -> dict[str, Any]:
+        return self._request_raw(
+            method="DELETE",
+            path=f"/api/cli/secrets/{quote(name, safe='')}",
+            query_params={"env": env},
+        )
+
+    def start_worker_services(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+        worker_id: str,
+        services: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        response_data = request_json(
+            method="POST",
+            path=f"/api/jobs/{job_id}/stages/{stage_index}/workers/{worker_id}/services/start",
+            base_url=self.base_url,
+            http_client=self._http_client,
+            json_payload={"services": services},
+            timeout_s=60.0,
+        )
+        if not isinstance(response_data, dict):
+            raise ValueError("runtime services response must be a JSON object")
+        return response_data
+
+    def get_worker_service(
+        self,
+        *,
+        job_id: str,
+        stage_index: int,
+        worker_id: str,
+        service_id: str,
+    ) -> dict[str, Any]:
+        response_data = request_json(
+            method="GET",
+            path=f"/api/jobs/{job_id}/stages/{stage_index}/workers/{worker_id}/services/{service_id}",
+            base_url=self.base_url,
+            http_client=self._http_client,
+        )
+        if not isinstance(response_data, dict):
+            raise ValueError("runtime service response must be a JSON object")
+        return response_data
+
+
+__all__ = [
+    "MacrodataApiError",
+    "MacrodataClient",
+    "request_json",
+    "resolve_platform_base_url",
+    "sanitize_terminal_text",
+    "verify_api_key",
+]

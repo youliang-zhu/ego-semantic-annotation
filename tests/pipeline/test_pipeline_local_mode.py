@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping, Sequence
+
+from refiner.execution.operators.row import execute_row_steps
+from refiner.pipeline import RefinerPipeline
+from refiner.pipeline.data.row import DictRow, Row
+from refiner.pipeline.data.shard import FilePart, Shard
+from refiner.pipeline.sources.readers.base import BaseReader
+from refiner.pipeline.steps import FnFlatMapStep
+
+
+class _LocalFakeReader(BaseReader):
+    def __init__(
+        self,
+        shards: list[Shard],
+        rows_by_shard_id: Mapping[str, Sequence[Row]],
+    ):
+        self._shards = shards
+        self._rows_by_shard_id = rows_by_shard_id
+
+    def list_shards(self) -> list[Shard]:
+        return list(self._shards)
+
+    def read_shard(self, shard: Shard) -> Iterator[Row]:
+        yield from self._rows_by_shard_id.get(shard.id, [])
+
+
+def _shard(path: str, start: int, end: int) -> Shard:
+    return Shard.from_file_parts([FilePart(path=path, start=start, end=end)])
+
+
+def test_iter_rows_is_lazy_and_crosses_shards() -> None:
+    s1 = _shard("a", 0, 1)
+    s2 = _shard("b", 0, 1)
+    rows = {
+        s1.id: [DictRow({"x": 1}), DictRow({"x": 2})],
+        s2.id: [DictRow({"x": 3}), DictRow({"x": 4})],
+    }
+    seen_batches: list[list[int]] = []
+
+    def batch_fn(batch: list[Row]):
+        seen_batches.append([int(r["x"]) for r in batch])
+        return batch
+
+    pipeline = (
+        RefinerPipeline(source=_LocalFakeReader([s1, s2], rows))
+        .map(lambda r: {"x": r["x"]})
+        .batch_map(batch_fn, batch_size=3)
+    )
+
+    it = iter(pipeline)
+    first = next(it)
+    assert first["x"] == 1
+    # The first batch should include rows from both shards due to local global stream.
+    assert seen_batches[0] == [1, 2, 3]
+
+
+def test_materialize_and_take() -> None:
+    s1 = _shard("a", 0, 1)
+    s2 = _shard("b", 0, 1)
+    rows = {
+        s1.id: [DictRow({"x": 1}), DictRow({"x": 2})],
+        s2.id: [DictRow({"x": 3})],
+    }
+    pipeline = RefinerPipeline(source=_LocalFakeReader([s1, s2], rows)).map(
+        lambda r: {"y": r["x"] * 10}
+    )
+
+    assert [r["y"] for r in pipeline.take(2)] == [10, 20]
+    assert [r["y"] for r in pipeline.materialize()] == [10, 20, 30]
+
+
+def test_batch_groups_split_on_increasing_batch_size() -> None:
+    s = _shard("a", 0, 1)
+    rows = {s.id: [DictRow({"x": i}) for i in range(10)]}
+    seen_4: list[int] = []
+    seen_8: list[int] = []
+
+    def b4(batch: list[Row]):
+        seen_4.append(len(batch))
+        return batch
+
+    def b8(batch: list[Row]):
+        seen_8.append(len(batch))
+        return batch
+
+    pipeline = (
+        RefinerPipeline(source=_LocalFakeReader([s], rows))
+        .batch_map(b4, batch_size=4)
+        .batch_map(b8, batch_size=8)
+    )
+
+    out = list(pipeline.iter_rows())
+    assert len(out) == 10
+    assert seen_4 == [4, 4, 2]
+    assert seen_8 == [8, 2]
+
+
+def test_downstream_batch_waits_after_upstream_drop() -> None:
+    s = _shard("a", 0, 1)
+    rows = {s.id: [DictRow({"x": i}) for i in range(8)]}
+    seen_b2: list[int] = []
+
+    def drop_to_one(batch: list[Row]):
+        if not batch:
+            return []
+        return [batch[0]]
+
+    def b2(batch: list[Row]):
+        seen_b2.append(len(batch))
+        return batch
+
+    pipeline = (
+        RefinerPipeline(source=_LocalFakeReader([s], rows))
+        .batch_map(drop_to_one, batch_size=4)
+        .batch_map(b2, batch_size=2)
+    )
+
+    out = list(pipeline.iter_rows())
+    assert len(out) == 2
+    # b2 should run once with a full batch collected across two upstream outputs.
+    assert seen_b2 == [2]
+
+
+def test_flat_map_can_expand_rows() -> None:
+    s = _shard("a", 0, 1)
+    rows = {s.id: [DictRow({"x": 1}), DictRow({"x": 2})]}
+
+    pipeline = RefinerPipeline(source=_LocalFakeReader([s], rows)).flat_map(
+        lambda r: [{"x": r["x"]}, {"x": r["x"] * 10}]
+    )
+
+    out = list(pipeline.iter_rows())
+    assert [r["x"] for r in out] == [1, 10, 2, 20]
+
+
+def test_flat_map_shard_delta_uses_emitted_row_shards() -> None:
+    deltas: list[dict[str, int]] = []
+    out = list(
+        execute_row_steps(
+            [DictRow({"x": 1}, shard_id="s1")],
+            [
+                FnFlatMapStep(
+                    fn=lambda row: [
+                        row.update(y=10),
+                        DictRow({"x": 2, "y": 20}, shard_id="s2"),
+                    ],
+                    index=1,
+                )
+            ],
+            on_shard_delta=deltas.append,
+        )
+    )
+
+    assert [row.shard_id for row in out] == ["s1", "s2"]
+    assert deltas == [{"s2": 1}]
+
+
+def test_filter_primitive_keeps_matching_rows() -> None:
+    s = _shard("a", 0, 1)
+    rows = {s.id: [DictRow({"x": i}) for i in range(6)]}
+
+    pipeline = (
+        RefinerPipeline(source=_LocalFakeReader([s], rows))
+        .filter(lambda r: int(r["x"]) % 2 == 0)
+        .map(lambda r: {"y": int(r["x"]) + 100})
+    )
+
+    out = list(pipeline.iter_rows())
+    assert [r["y"] for r in out] == [100, 102, 104]

@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+from typing import IO, Any
+from typing import TYPE_CHECKING
+
+from refiner.io import DataFolder
+from refiner.execution.asyncio.runtime import io_executor
+from refiner.pipeline.utils.cache.decoder_cache import (
+    OpenedVideoSource,
+    VideoSourceProbe,
+    get_opened_video_source_cache,
+    open_video_source,
+    reset_opened_video_source_cache,
+)
+from refiner.pipeline.utils.cache.lease_cache import CacheLease
+from refiner.utils import check_required_dependencies
+
+if TYPE_CHECKING:
+    from refiner.video.types import VideoBytes, VideoFile
+
+_SEGMENTED_MP4_MOVFLAGS = "frag_keyframe+default_base_moof"
+
+
+def video_from_timestamp_s(video: VideoFile | VideoBytes) -> float:
+    return float(video.from_timestamp_s or 0.0)
+
+
+def video_to_timestamp_s(video: VideoFile | VideoBytes) -> float | None:
+    return video.to_timestamp_s
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPtsAlignment:
+    probe: VideoSourceProbe
+    start_pts: int
+    end_pts: int
+
+
+@dataclass(slots=True)
+class PreparedVideoSource:
+    lease: CacheLease[str, OpenedVideoSource] | None
+    source: OpenedVideoSource | None
+    video: VideoFile | VideoBytes
+    uri: str
+    probe: VideoSourceProbe | None
+    alignment: VideoPtsAlignment | None
+    container: Any
+    stream: Any
+
+    def close(self) -> None:
+        if self.lease is not None:
+            self.lease.release()
+            return
+        if self.source is not None:
+            self.source.close()
+
+
+class RemuxWriter:
+    def __init__(
+        self,
+        *,
+        probe: VideoSourceProbe,
+        output_file: IO[bytes],
+        container: Any,
+    ) -> None:
+        self.probe = probe
+        self.output_file = output_file
+        self.container = container
+        self.stream: Any | None = None
+        self.output_offset_pts = 0
+
+    @classmethod
+    def open(
+        cls,
+        *,
+        folder: DataFolder,
+        output_rel: str,
+        probe: VideoSourceProbe,
+    ) -> "RemuxWriter":
+        check_required_dependencies("video remuxing", ["av"], dist="video")
+        output_file = folder.open(output_rel, mode="wb")
+        return cls.open_file(
+            output_file=output_file,
+            probe=probe,
+        )
+
+    @classmethod
+    def open_file(
+        cls,
+        *,
+        output_file: IO[bytes],
+        probe: VideoSourceProbe,
+        movflags: str | None = _SEGMENTED_MP4_MOVFLAGS,
+    ) -> "RemuxWriter":
+        check_required_dependencies("video remuxing", ["av"], dist="video")
+        import av
+
+        try:
+            options = {"movflags": movflags} if movflags is not None else None
+            container = av.open(
+                output_file,
+                mode="w",
+                format="mp4",
+                options=options,
+            )
+        except Exception:
+            output_file.close()
+            raise
+        return cls(probe=probe, output_file=output_file, container=container)
+
+    @property
+    def size_bytes(self) -> int:
+        return int(self.output_file.tell())
+
+    def close(self) -> None:
+        self.container.close()
+        self.output_file.close()
+
+    def append_prepared_video(
+        self,
+        prepared: PreparedVideoSource,
+    ) -> tuple[float, float]:
+        if (
+            prepared.probe is None
+            or prepared.alignment is None
+            or not probes_are_remux_compatible(prepared.probe, self.probe)
+        ):
+            raise ValueError("Prepared source is not remuxable")
+
+        probe = prepared.probe
+        input_container = prepared.container
+        input_stream = prepared.stream
+        start_pts = prepared.alignment.start_pts
+        end_pts = prepared.alignment.end_pts
+        output_base_pts = self.output_offset_pts
+        time_base_s = float(probe.time_base)
+
+        if self.stream is None:
+            self.stream = self.container.add_stream_from_template(
+                template=input_stream,
+                opaque=True,
+            )
+        stream = self.stream
+        if stream is None:
+            raise RuntimeError("Remux output stream was not initialized")
+        stream.time_base = input_stream.time_base
+
+        for packet in input_container.demux(input_stream):
+            if packet.pts is None or packet.dts is None:
+                continue
+            packet_pts = int(packet.pts)
+            if packet_pts < start_pts:
+                continue
+            if packet_pts >= end_pts:
+                break
+            packet.pts = int(packet.pts) - start_pts + self.output_offset_pts
+            packet.dts = int(packet.dts) - start_pts + self.output_offset_pts
+            packet.stream = stream
+            self.container.mux(packet)
+
+        self.output_offset_pts += end_pts - start_pts
+        out_from_s = float(output_base_pts) * time_base_s
+        out_to_s = float(output_base_pts + (end_pts - start_pts)) * time_base_s
+        return out_from_s, out_to_s
+
+
+def probes_are_remux_compatible(
+    left: VideoSourceProbe,
+    right: VideoSourceProbe,
+) -> bool:
+    return (
+        left.width == right.width
+        and left.height == right.height
+        and left.fps == right.fps
+        and left.time_base == right.time_base
+        and left.codec == right.codec
+        and left.pix_fmt == right.pix_fmt
+        and not left.has_audio
+        and not right.has_audio
+    )
+
+
+def prepared_source_is_remuxable(prepared: PreparedVideoSource) -> bool:
+    probe = prepared.probe
+    if probe is None or prepared.alignment is None:
+        return False
+    if probe.has_audio:
+        return False
+    return probes_are_remux_compatible(probe, probe)
+
+
+def probe_for_remux(
+    *,
+    probe: VideoSourceProbe | None,
+    video: VideoFile | VideoBytes,
+) -> tuple[VideoSourceProbe | None, VideoPtsAlignment | None]:
+    if probe is None:
+        return None, None
+
+    video_end_s = video_to_timestamp_s(video)
+    if video_end_s is None:
+        return probe, None
+
+    time_base_s = float(probe.time_base)
+    start_pts = max(0, int(round(video_from_timestamp_s(video) / time_base_s)))
+    end_pts = max(start_pts + 1, int(round(video_end_s / time_base_s)))
+    return probe, VideoPtsAlignment(
+        probe=probe,
+        start_pts=start_pts,
+        end_pts=end_pts,
+    )
+
+
+async def prepare_video_source(
+    *,
+    video: VideoFile | VideoBytes,
+) -> PreparedVideoSource:
+    check_required_dependencies("video decoding", ["av"], dist="video")
+    from refiner.video.types import VideoFile
+
+    lease: CacheLease[str, OpenedVideoSource] | None = None
+    direct_source: OpenedVideoSource | None = None
+    if isinstance(video, VideoFile):
+        lease = await get_opened_video_source_cache().acquire(video.uri)
+        source = lease.resource
+    else:
+        import asyncio
+
+        source = await asyncio.get_running_loop().run_in_executor(
+            io_executor(),
+            partial(open_video_source, video=video),
+        )
+        direct_source = source
+
+    try:
+        start_pts = 0
+        if source.stream.time_base is not None:
+            start_pts = max(
+                0,
+                int(
+                    round(
+                        video_from_timestamp_s(video) / float(source.stream.time_base)
+                    )
+                ),
+            )
+
+        try:
+            source.container.seek(start_pts, stream=source.stream, backward=True)
+        except Exception:
+            try:
+                source.container.seek(
+                    max(0, start_pts),
+                    stream=source.stream,
+                    backward=True,
+                    any_frame=True,
+                )
+            except Exception:
+                pass
+
+        probe, alignment = probe_for_remux(probe=source.probe, video=video)
+        return PreparedVideoSource(
+            lease=lease,
+            source=direct_source,
+            video=video,
+            uri=source.uri,
+            probe=probe,
+            alignment=alignment,
+            container=source.container,
+            stream=source.stream,
+        )
+    except Exception:
+        if lease is not None:
+            lease.release()
+        elif direct_source is not None:
+            direct_source.close()
+        raise
+
+
+__all__ = [
+    "PreparedVideoSource",
+    "RemuxWriter",
+    "VideoPtsAlignment",
+    "prepared_source_is_remuxable",
+    "prepare_video_source",
+    "probe_for_remux",
+    "probes_are_remux_compatible",
+    "reset_opened_video_source_cache",
+    "video_from_timestamp_s",
+    "video_to_timestamp_s",
+]

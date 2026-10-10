@@ -1,0 +1,995 @@
+from __future__ import annotations
+
+import threading
+from collections.abc import Iterator, Mapping, Sequence
+from collections import defaultdict
+from typing import Any, cast
+
+import pyarrow as pa
+import pytest
+
+from refiner.pipeline.data.shard import Shard
+from refiner import register_gauge
+from refiner.pipeline import RefinerPipeline, task
+from refiner.pipeline.expressions import col
+from refiner.execution.engine import iter_rows
+from refiner.pipeline.sinks import BaseSink
+from refiner.pipeline.data.shard import FilePart
+from refiner.services import RuntimeServiceSpec
+from refiner.worker.runner import Worker
+from refiner.pipeline.sources.readers.base import BaseReader
+from refiner.pipeline.data.row import DictRow, Row
+from refiner.worker.metrics.api import log_gauge
+from refiner.worker.metrics.emitter import UserMetricsEmitter
+from refiner.worker.lifecycle import FinalizedShardWorker, sort_finalized_workers
+
+
+class _FakeReader(BaseReader):
+    def __init__(self, rows_by_shard_id: Mapping[str, Sequence[Row]]):
+        self.rows_by_shard_id = rows_by_shard_id
+
+    def list_shards(self) -> list[Shard]:
+        return []
+
+    def read_shard(self, shard: Shard) -> Iterator[Row]:
+        for row in self.rows_by_shard_id.get(shard.id, []):
+            yield row
+
+
+class _PrepareBeforeSchemaReader(_FakeReader):
+    def __init__(self, rows_by_shard_id: Mapping[str, Sequence[Row]]):
+        super().__init__(rows_by_shard_id)
+        self.prepared = False
+
+    def prepare_shard(self, shard: Shard) -> None:
+        del shard
+        self.prepared = True
+
+    @property
+    def schema(self) -> pa.Schema:
+        if not self.prepared:
+            raise RuntimeError("source schema accessed before shard preparation")
+        return pa.schema([pa.field("x", pa.int64())])
+
+
+class _FakeRuntimeLifecycle:
+    def __init__(self, shards: list[Shard]):
+        self.worker_id = "local"
+        self._remaining = list(shards)
+        self.claim_previous: list[Shard | None] = []
+        self.heartbeat_snapshots: list[list[str]] = []
+        self.completed_ids: list[str] = []
+        self.failed_ids: list[str] = []
+        self.failed_errors: list[str | None] = []
+
+    def claim(self, previous: Shard | None = None) -> Shard | None:
+        self.claim_previous.append(previous)
+        if not self._remaining:
+            return None
+        return self._remaining.pop(0)
+
+    def complete(self, shard: Shard) -> None:
+        self.completed_ids.append(shard.id)
+
+    def heartbeat(self, shards: list[Shard]) -> None:
+        self.heartbeat_snapshots.append([shard.id for shard in shards])
+
+    def fail(self, shard: Shard, error: str | None = None) -> None:
+        self.failed_ids.append(shard.id)
+        self.failed_errors.append(error)
+
+    def finalized_workers(
+        self, *, stage_index: int | None = None
+    ) -> list[FinalizedShardWorker]:
+        del stage_index
+        return []
+
+
+def _shard(path: str, start: int, end: int) -> Shard:
+    return Shard.from_file_parts([FilePart(path=path, start=start, end=end)])
+
+
+def test_sort_finalized_workers_uses_legacy_order_when_any_ordinal_is_missing() -> None:
+    rows = [
+        FinalizedShardWorker("shard-c", "worker-c", global_ordinal=0),
+        FinalizedShardWorker("shard-a", "worker-a"),
+        FinalizedShardWorker("shard-b", "worker-b", global_ordinal=1),
+    ]
+
+    assert [row.shard_id for row in sort_finalized_workers(rows)] == [
+        "shard-a",
+        "shard-b",
+        "shard-c",
+    ]
+
+
+class _NoopTelemetryEmitter(UserMetricsEmitter):
+    def emit_user_counter(self, **kwargs) -> None:
+        del kwargs
+
+    def emit_user_gauge(self, **kwargs) -> None:
+        del kwargs
+
+    def register_user_gauge(self, **kwargs) -> None:
+        del kwargs
+
+    def emit_user_histogram(self, **kwargs) -> None:
+        del kwargs
+
+    def force_flush_user_metrics(self) -> None:
+        return None
+
+    def force_flush_resource_metrics(self) -> None:
+        return None
+
+    def force_flush_logs(self) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+class _RecordingSink(BaseSink):
+    def __init__(self) -> None:
+        self.written_counts: list[dict[str, int]] = []
+        self.completed_shards: list[str] = []
+
+    def write_block(self, block) -> tuple[dict[str, int], int]:
+        if isinstance(block, list):
+            counts: dict[str, int] = {}
+            for row in block:
+                shard_id = row.require_shard_id()
+                counts[shard_id] = counts.get(shard_id, 0) + 1
+        else:
+            counts = {}
+            for shard_id in block.column("__shard_id").to_pylist():
+                counts[shard_id] = counts.get(shard_id, 0) + 1
+        self.written_counts.append(counts)
+        return counts, sum(counts.values())
+
+    def on_shard_complete(self, shard_id: str) -> None:
+        self.completed_shards.append(shard_id)
+
+
+class _CloseFailingSink(_RecordingSink):
+    def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
+class _ShortWriteAndCloseFailingSink(_CloseFailingSink):
+    def write_block(self, block) -> tuple[dict[str, int], int]:
+        counts, _output_rows = super().write_block(block)
+        return {shard_id: 1 for shard_id in counts}, 1
+
+
+class _MetricRecordingTelemetryEmitter(_NoopTelemetryEmitter):
+    def __init__(self) -> None:
+        self.counters: list[dict[str, Any]] = []
+        self.histograms: list[dict[str, Any]] = []
+        self.gauges: list[dict[str, Any]] = []
+        self.registered_gauges: list[dict[str, Any]] = []
+
+    def emit_user_counter(self, **kwargs) -> None:
+        self.counters.append(kwargs)
+
+    def emit_user_histogram(self, **kwargs) -> None:
+        self.histograms.append(kwargs)
+
+    def emit_user_gauge(self, **kwargs) -> None:
+        self.gauges.append(kwargs)
+
+    def register_user_gauge(self, **kwargs) -> None:
+        self.registered_gauges.append(kwargs)
+
+
+class _ShutdownFailingTelemetryEmitter(_NoopTelemetryEmitter):
+    def shutdown(self) -> None:
+        raise RuntimeError("telemetry shutdown failed")
+
+
+def _run_local_worker(
+    *,
+    rows_by_shard: Mapping[str, Sequence[Row]],
+    runtime_lifecycle: _FakeRuntimeLifecycle,
+    sink: BaseSink | None = None,
+    transform=None,
+) -> Worker:
+    pipeline = RefinerPipeline(source=_FakeReader(rows_by_shard))
+    if transform is not None:
+        pipeline = pipeline.map(transform)
+    if sink is not None:
+        pipeline = pipeline.with_sink(sink)
+
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        runtime_lifecycle=runtime_lifecycle,
+    )
+    return worker
+
+
+def _steps_by_label(metrics: list[dict[str, Any]]) -> dict[str, list[int]]:
+    out: dict[str, set[int]] = defaultdict(set)
+    for metric in metrics:
+        out[cast(str, metric["label"])].add(cast(int, metric["step_index"]))
+    return {label: sorted(steps) for label, steps in out.items()}
+
+
+def test_pipeline_executes_row_and_batch_steps() -> None:
+    source_rows = [
+        DictRow({"x": 1}),
+        DictRow({"x": 2}),
+        DictRow({"x": 3}),
+        DictRow({"x": 4}),
+    ]
+    pipeline = (
+        RefinerPipeline(source=_FakeReader({}))
+        .map(lambda r: {"x": r["x"] + 1})
+        .filter(lambda r: int(r["x"]) % 2 != 0)
+        .batch_map(lambda rows: [row for row in rows if row["x"] >= 3], batch_size=2)
+        .map(lambda r: {"y": r["x"] * 10})
+    )
+
+    out = list(iter_rows(pipeline.execute(source_rows)))
+
+    assert [r["x"] for r in out] == [3, 5]
+    assert [r["y"] for r in out] == [30, 50]
+
+
+def test_worker_prepares_claimed_shard_before_accessing_source_schema() -> None:
+    shard = _shard("input", 0, 10)
+    source = _PrepareBeforeSchemaReader({shard.id: [DictRow({"x": 1})]})
+    lifecycle = _FakeRuntimeLifecycle([shard])
+
+    stats = Worker(
+        pipeline=RefinerPipeline(source=source),
+        job_id="job",
+        stage_index=0,
+        worker_id=lifecycle.worker_id,
+        runtime_lifecycle=lifecycle,
+    ).run()
+
+    assert source.prepared is True
+    assert stats.completed == 1
+
+
+def test_worker_runs_fused_pipeline_and_updates_runtime_lifecycle() -> None:
+    shard1 = _shard("p1", 0, 10)
+    shard2 = _shard("p2", 0, 10)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard1, shard2])
+
+    rows_by_shard = {
+        shard1.id: [
+            DictRow({"sid": shard1.id, "x": 1}),
+            DictRow({"sid": shard1.id, "x": 2}),
+        ],
+        shard2.id: [DictRow({"sid": shard2.id, "x": 10})],
+    }
+    emitted: list[tuple[str, int]] = []
+
+    def tap(row: Row) -> Row:
+        emitted.append((row["sid"], row["x"]))
+        return row
+
+    pipeline = (
+        RefinerPipeline(source=_FakeReader(rows_by_shard))
+        .map(lambda r: {"x": r["x"] + 1})
+        .batch_map(lambda rows: list(reversed(rows)), batch_size=2)
+        .map(tap)
+    )
+
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.claimed == 2
+    assert stats.completed == 2
+    assert stats.failed == 0
+    assert stats.output_rows == 3
+    assert runtime_lifecycle.completed_ids == [shard1.id, shard2.id]
+    assert runtime_lifecycle.failed_ids == []
+    assert runtime_lifecycle.claim_previous[0] is None
+    assert runtime_lifecycle.claim_previous[1] == shard1
+    assert emitted == [(shard1.id, 3), (shard1.id, 2), (shard2.id, 11)]
+
+
+def test_worker_uses_explicit_runtime_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    shard = _shard("p", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    service = RuntimeServiceSpec(
+        name="vllm-demo",
+        kind="llm",
+        config={"model_name_or_path": "Qwen/Qwen3.5-9B", "config": "throughput"},
+    )
+    started_services: list[tuple[RuntimeServiceSpec, ...]] = []
+
+    class _FakeServiceManager:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def start_services(self, services) -> None:
+            started_services.append(tuple(services))
+
+    monkeypatch.setattr("refiner.worker.runner.ServiceManager", _FakeServiceManager)
+    worker = Worker(
+        pipeline=RefinerPipeline(source=_FakeReader({shard.id: [DictRow({"x": 1})]})),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+        runtime_services=[service],
+    )
+
+    stats = worker.run()
+
+    assert stats.completed == 1
+    assert started_services == [(service,)]
+
+
+def test_worker_sends_heartbeat_for_inflight_shards() -> None:
+    import time
+
+    shard = _shard("slow", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+
+    def slow(row: Row) -> Row:
+        time.sleep(1.1)
+        return row
+
+    worker = _run_local_worker(
+        rows_by_shard={shard.id: [DictRow({"x": 1})]},
+        runtime_lifecycle=runtime_lifecycle,
+        transform=slow,
+    )
+    worker.heartbeat_interval_seconds = 1
+
+    stats = worker.run()
+
+    assert stats.completed == 1
+    assert runtime_lifecycle.heartbeat_snapshots
+    assert runtime_lifecycle.heartbeat_snapshots[0] == [shard.id]
+
+
+def test_worker_fails_entire_claimed_group_on_exception() -> None:
+    shard1 = _shard("ok", 0, 1)
+    shard2 = _shard("boom", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard1, shard2])
+
+    rows_by_shard = {
+        shard1.id: [DictRow({"x": 1})],
+        shard2.id: [DictRow({"x": 2})],
+    }
+
+    def maybe_fail(row: Row) -> Row:
+        if row["x"] == 2:
+            raise RuntimeError("kaboom")
+        return row
+
+    pipeline = RefinerPipeline(source=_FakeReader(rows_by_shard)).map(maybe_fail)
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.claimed == 2
+    assert stats.completed == 0
+    assert stats.failed == 2
+    assert runtime_lifecycle.completed_ids == []
+    assert runtime_lifecycle.failed_ids == [shard1.id, shard2.id]
+    assert runtime_lifecycle.failed_errors == [
+        "kaboom | step_index=1",
+        "kaboom | step_index=1",
+    ]
+
+
+def test_worker_failure_uses_exception_type_when_message_is_empty() -> None:
+    shard = _shard("boom", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 1})]}
+
+    def fail(row: Row) -> Row:
+        del row
+        raise RuntimeError()
+
+    worker = Worker(
+        pipeline=RefinerPipeline(source=_FakeReader(rows_by_shard)).map(fail),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.failed == 1
+    assert runtime_lifecycle.failed_errors == ["RuntimeError | step_index=1"]
+
+
+def test_worker_failure_reports_vectorized_step_index() -> None:
+    shard = _shard("bad-cast", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": "abc"})]}
+
+    worker = Worker(
+        pipeline=RefinerPipeline(source=_FakeReader(rows_by_shard)).cast(x="int64"),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.failed == 1
+    assert len(runtime_lifecycle.failed_errors) == 1
+    assert runtime_lifecycle.failed_errors[0].endswith("| step_index=1")
+
+
+def test_worker_can_batch_across_shards() -> None:
+    shard1 = _shard("s1", 0, 1)
+    shard2 = _shard("s2", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard1, shard2])
+
+    rows_by_shard = {
+        shard1.id: [DictRow({"sid": shard1.id, "x": 1})],
+        shard2.id: [DictRow({"sid": shard2.id, "x": 2})],
+    }
+    emitted: list[str] = []
+
+    def tap(row: Row) -> Row:
+        emitted.append(row["sid"])
+        return row
+
+    pipeline = (
+        RefinerPipeline(source=_FakeReader(rows_by_shard))
+        .batch_map(lambda rows: list(reversed(rows)), batch_size=2)
+        .map(tap)
+    )
+    assert pipeline.source.claim_shards_sequentially is False
+
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+    stats = worker.run()
+
+    assert stats.claimed == 2
+    assert stats.completed == 2
+    assert emitted == [shard2.id, shard1.id]
+
+
+def test_task_worker_finalizes_first_shard_before_claiming_second() -> None:
+    events: list[str] = []
+
+    def run_task(rank: int, _world_size: int) -> dict[str, int]:
+        events.append(f"execute:{rank}")
+        return {"rank": rank}
+
+    pipeline = task(run_task, num_tasks=2).batch_map(
+        lambda rows: rows,
+        batch_size=8,
+    )
+    shards = pipeline.list_shards()
+
+    class _OrderedRuntimeLifecycle(_FakeRuntimeLifecycle):
+        def claim(self, previous: Shard | None = None) -> Shard | None:
+            shard = super().claim(previous)
+            if shard is not None:
+                events.append(f"claim:{shard.global_ordinal}")
+            return shard
+
+    class _FinalizingSink(_RecordingSink):
+        def on_shard_finalized(self, shard_id: str) -> None:
+            events.append(f"sink_finalized:{shard_id}")
+
+    runtime_lifecycle = _OrderedRuntimeLifecycle(shards)
+    worker = Worker(
+        pipeline=pipeline.with_sink(_FinalizingSink()),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    first_finalized = events.index(f"sink_finalized:{shards[0].id}")
+    second_claimed = events.index("claim:1")
+    assert first_finalized < second_claimed
+    assert events.index("execute:0") < second_claimed
+    assert stats.completed == 2
+
+
+def test_task_can_claim_shards_without_waiting_for_completion() -> None:
+    events: list[str] = []
+
+    def run_task(rank: int, _world_size: int) -> dict[str, int]:
+        events.append(f"execute:{rank}")
+        return {"rank": rank}
+
+    pipeline = task(
+        run_task,
+        num_tasks=2,
+        claim_shards_sequentially=False,
+    ).batch_map(lambda rows: rows, batch_size=2)
+    shards = pipeline.list_shards()
+
+    class _OrderedRuntimeLifecycle(_FakeRuntimeLifecycle):
+        def claim(self, previous: Shard | None = None) -> Shard | None:
+            shard = super().claim(previous)
+            if shard is not None:
+                events.append(f"claim:{shard.global_ordinal}")
+            return shard
+
+    class _FinalizingSink(_RecordingSink):
+        def on_shard_finalized(self, shard_id: str) -> None:
+            events.append(f"sink_finalized:{shard_id}")
+
+    runtime_lifecycle = _OrderedRuntimeLifecycle(shards)
+    worker = Worker(
+        pipeline=pipeline.with_sink(_FinalizingSink()),
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert events.index("claim:1") < events.index(f"sink_finalized:{shards[0].id}")
+    assert stats.completed == 2
+
+
+def test_task_worker_keeps_async_callable_open_across_claim_windows() -> None:
+    class _AsyncCallable:
+        def __init__(self) -> None:
+            self.closed = False
+            self.close_calls = 0
+            self.ranks: list[int] = []
+
+        async def __call__(self, row: Row) -> dict[str, int]:
+            if self.closed:
+                raise RuntimeError("async callable reused after close")
+            rank = int(row["task_rank"])
+            self.ranks.append(rank)
+            return {"rank": rank}
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+
+    fn = _AsyncCallable()
+    metrics = _MetricRecordingTelemetryEmitter()
+    pipeline = task(lambda rank, _world_size: {"rank": rank}, num_tasks=2).map_async(
+        fn,
+        max_in_flight=1,
+    )
+    runtime_lifecycle = _FakeRuntimeLifecycle(pipeline.list_shards())
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        runtime_lifecycle=runtime_lifecycle,
+        user_metrics_emitter=metrics,
+    )
+
+    stats = worker.run()
+
+    assert stats.completed == 2
+    assert fn.ranks == [0, 1]
+    assert fn.close_calls == 1
+    assert len(metrics.registered_gauges) == 1
+
+
+def test_worker_propagates_async_teardown_failure_after_completion() -> None:
+    class _AsyncCallable:
+        async def __call__(self, row: Row) -> dict[str, int]:
+            return {"rank": int(row["task_rank"])}
+
+        async def aclose(self) -> None:
+            raise RuntimeError("async teardown failed")
+
+    pipeline = task(
+        lambda rank, _world_size: {"rank": rank},
+        num_tasks=1,
+    ).map_async(_AsyncCallable())
+    shards = pipeline.list_shards()
+    runtime_lifecycle = _FakeRuntimeLifecycle(shards)
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    with pytest.raises(RuntimeError, match="async teardown failed"):
+        worker.run()
+
+    assert runtime_lifecycle.completed_ids == [shards[0].id]
+    assert runtime_lifecycle.failed_ids == []
+
+
+def test_worker_propagates_factory_failure_before_claiming_a_shard() -> None:
+    def fail_factory():
+        raise RuntimeError("factory initialization failed")
+
+    pipeline = task(
+        lambda rank, _world_size: {"rank": rank},
+        num_tasks=1,
+    ).map_async(factory=fail_factory)
+    runtime_lifecycle = _FakeRuntimeLifecycle(pipeline.list_shards())
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    with pytest.raises(RuntimeError, match="factory initialization failed"):
+        worker.run()
+
+    assert runtime_lifecycle.claim_previous == []
+    assert runtime_lifecycle.completed_ids == []
+    assert runtime_lifecycle.failed_ids == []
+
+
+def test_task_worker_stops_claiming_after_heartbeat_failure() -> None:
+    heartbeat_should_fail = threading.Event()
+
+    class _HeartbeatFailingRuntimeLifecycle(_FakeRuntimeLifecycle):
+        def heartbeat(self, shards: list[Shard]) -> None:
+            super().heartbeat(shards)
+            if heartbeat_should_fail.is_set():
+                raise RuntimeError("heartbeat unavailable")
+
+    class _FailHeartbeatAfterWriteSink(_RecordingSink):
+        def write_block(self, block) -> tuple[dict[str, int], int]:
+            result = super().write_block(block)
+            heartbeat_should_fail.set()
+            heartbeat_thread = next(
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "refiner-heartbeat-test-worker"
+            )
+            heartbeat_thread.join(timeout=2)
+            assert not heartbeat_thread.is_alive()
+            return result
+
+    pipeline = task(lambda rank, _world_size: {"rank": rank}, num_tasks=2)
+    runtime_lifecycle = _HeartbeatFailingRuntimeLifecycle(pipeline.list_shards())
+    worker = Worker(
+        pipeline=pipeline.with_sink(_FailHeartbeatAfterWriteSink()),
+        job_id="job",
+        stage_index=0,
+        worker_id="local",
+        worker_name="test-worker",
+        heartbeat_interval_seconds=1,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert len(runtime_lifecycle.claim_previous) == 1
+    assert stats.claimed == 1
+    assert stats.completed == 1
+
+
+def test_worker_runtime_complete_errors_fail_the_shard_without_crashing() -> None:
+    shard = _shard("p", 0, 1)
+    rows_by_shard = {shard.id: [DictRow({"x": 1})]}
+    pipeline = RefinerPipeline(source=_FakeReader(rows_by_shard))
+
+    class _FailingCompleteRuntimeLifecycle(_FakeRuntimeLifecycle):
+        def complete(self, shard: Shard) -> None:
+            del shard
+            raise RuntimeError("complete failed")
+
+    runtime_lifecycle = _FailingCompleteRuntimeLifecycle([shard])
+    worker = Worker(
+        pipeline=pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+    stats = worker.run()
+
+    assert stats.claimed == 1
+    assert stats.completed == 0
+    assert stats.failed == 1
+    assert runtime_lifecycle.completed_ids == []
+    assert runtime_lifecycle.failed_ids == [shard.id]
+    assert runtime_lifecycle.failed_errors == ["complete failed"]
+
+
+def test_worker_completes_shards_only_after_sink_drain() -> None:
+    shard = _shard("p", 0, 2)
+    rows_by_shard = {
+        shard.id: [DictRow({"x": 1}), DictRow({"x": 2})],
+    }
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    sink = _RecordingSink()
+
+    worker = Worker(
+        pipeline=RefinerPipeline(source=_FakeReader(rows_by_shard)).with_sink(sink),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.completed == 1
+    assert sum(batch.get(shard.id, 0) for batch in sink.written_counts) == 2
+    assert sink.completed_shards == [shard.id]
+    assert runtime_lifecycle.completed_ids == [shard.id]
+
+
+def test_worker_runs_post_completion_sink_hook_after_runtime_complete() -> None:
+    shard = _shard("p", 0, 1)
+    events: list[str] = []
+
+    class _OrderedRuntimeLifecycle(_FakeRuntimeLifecycle):
+        def complete(self, shard: Shard) -> None:
+            super().complete(shard)
+            events.append("runtime_complete")
+
+    class _OrderedSink(_RecordingSink):
+        def on_shard_complete(self, shard_id: str) -> None:
+            super().on_shard_complete(shard_id)
+            events.append("sink_complete")
+
+        def on_shard_finalized(self, shard_id: str) -> None:
+            events.append("sink_finalized")
+
+    runtime_lifecycle = _OrderedRuntimeLifecycle([shard])
+    sink = _OrderedSink()
+    worker = Worker(
+        pipeline=RefinerPipeline(
+            source=_FakeReader({shard.id: [DictRow({"x": 1})]})
+        ).with_sink(sink),
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.completed == 1
+    assert events == ["sink_complete", "runtime_complete", "sink_finalized"]
+
+
+def test_worker_metrics_use_correct_step_indexes_for_all_block_types(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    shard = _shard("p", 0, 3)
+    rows_by_shard = {
+        shard.id: [
+            DictRow({"x": 1, "raw": " a ", "dropme": "x"}),
+            DictRow({"x": 2, "raw": " b ", "dropme": "y"}),
+            DictRow({"x": 3, "raw": " c ", "dropme": "z"}),
+        ],
+    }
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    emitter = _MetricRecordingTelemetryEmitter()
+    monkeypatch.setattr("refiner.worker.runner.NOOP_USER_METRICS_EMITTER", emitter)
+
+    async def add_async(row: Row) -> dict[str, int]:
+        log_gauge("async_gauge", int(row["x"]))
+        register_gauge("async_registered", lambda: 1)
+        return {"score_int": int(row["score_int"]) + 1}
+
+    pipeline = (
+        RefinerPipeline(source=_FakeReader(rows_by_shard))
+        .with_column("score", col("x") + 10)
+        .with_columns(clean=col("raw").str.strip(), keep=col("x") >= 2)
+        .filter(col("keep"))
+        .map_table(
+            lambda table: (
+                log_gauge("table_gauge", table.num_rows),
+                register_gauge("table_registered", lambda: table.num_rows),
+                table.append_column("mapped", pa.array(["m"] * table.num_rows)),
+            )[2]
+        )
+        .select("x", "score", "clean", "dropme", "mapped")
+        .drop("dropme")
+        .rename(score="score_int")
+        .cast(score_int="int64")
+        .map(
+            lambda row: (
+                log_gauge("map_gauge", int(row["x"])),
+                register_gauge("map_registered", lambda: 1),
+                row.log_histogram("map_hist", int(row["x"]), unit="rows"),
+                {"score_int": int(row["score_int"]) * 2},
+            )[3]
+        )
+        .map_async(add_async)
+        .filter(lambda row: int(row["x"]) == 2)
+        .flat_map(
+            lambda row: (
+                log_gauge("flat_map_gauge", 2),
+                register_gauge("flat_map_registered", lambda: 2),
+                row.log_throughput("flat_map_counter", 1, unit="rows"),
+                [{"variant": "base"}, {"variant": "extra"}],
+            )[3]
+        )
+        .batch_map(
+            lambda rows: (
+                log_gauge("batch_gauge", len(rows)),
+                register_gauge("batch_registered", lambda: len(rows)),
+                rows,
+            )[2],
+            batch_size=2,
+        )
+        .write_jsonl(tmp_path / "out")
+    )
+
+    worker = Worker(
+        pipeline=pipeline.primary_pipeline,
+        job_id="job",
+        stage_index=0,
+        worker_id=runtime_lifecycle.worker_id,
+        runtime_lifecycle=runtime_lifecycle,
+    )
+
+    stats = worker.run()
+
+    assert stats.completed == 1
+    assert stats.output_rows == 2
+
+    counter_steps_by_label = _steps_by_label(emitter.counters)
+    histogram_steps_by_label = _steps_by_label(emitter.histograms)
+    gauge_steps_by_label = _steps_by_label(emitter.gauges)
+    registered_gauge_steps_by_label = _steps_by_label(emitter.registered_gauges)
+
+    assert counter_steps_by_label["rows_read"] == [0]
+    assert counter_steps_by_label["rows_processed"] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+    ]
+    assert counter_steps_by_label["rows_kept"] == [3, 11]
+    assert counter_steps_by_label["rows_dropped"] == [3, 11]
+    assert counter_steps_by_label["flat_map_counter"] == [12]
+    assert counter_steps_by_label["rows_out"] == [13]
+    assert counter_steps_by_label["rows_written"] == [14]
+    assert counter_steps_by_label["files_written"] == [14]
+    assert histogram_steps_by_label["map_hist"] == [9]
+    assert histogram_steps_by_label["rows_out"] == [12]
+    assert gauge_steps_by_label["table_gauge"] == [4]
+    assert gauge_steps_by_label["map_gauge"] == [9]
+    assert gauge_steps_by_label["async_gauge"] == [10]
+    assert gauge_steps_by_label["flat_map_gauge"] == [12]
+    assert gauge_steps_by_label["batch_gauge"] == [13]
+    assert registered_gauge_steps_by_label["table_registered"] == [4]
+    assert registered_gauge_steps_by_label["map_registered"] == [9]
+    assert registered_gauge_steps_by_label["async_registered"] == [10]
+    assert registered_gauge_steps_by_label["flat_map_registered"] == [12]
+    assert registered_gauge_steps_by_label["batch_registered"] == [13]
+
+
+def test_worker_suppresses_sink_close_errors_after_execution_failure() -> None:
+    shard = _shard("boom", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 2})]}
+
+    def maybe_fail(row: Row) -> Row:
+        raise RuntimeError("kaboom")
+
+    stats = _run_local_worker(
+        rows_by_shard=rows_by_shard,
+        runtime_lifecycle=runtime_lifecycle,
+        sink=_CloseFailingSink(),
+        transform=maybe_fail,
+    )
+    stats = stats.run()
+
+    assert stats.failed == 1
+    assert runtime_lifecycle.failed_ids == [shard.id]
+    assert runtime_lifecycle.failed_errors == ["kaboom | step_index=1"]
+
+
+def test_worker_suppresses_sink_close_errors_after_run_failure() -> None:
+    shard = _shard("p", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 1}), DictRow({"x": 2})]}
+
+    worker = _run_local_worker(
+        rows_by_shard=rows_by_shard,
+        runtime_lifecycle=runtime_lifecycle,
+        sink=_ShortWriteAndCloseFailingSink(),
+    )
+
+    with pytest.raises(RuntimeError, match="worker finished with unflushed shards"):
+        worker.run()
+
+
+def test_worker_marks_inflight_shards_failed_on_keyboard_interrupt() -> None:
+    shard = _shard("interrupt", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 1})]}
+
+    def interrupt(row: Row) -> Row:
+        del row
+        raise KeyboardInterrupt
+
+    worker = _run_local_worker(
+        rows_by_shard=rows_by_shard,
+        runtime_lifecycle=runtime_lifecycle,
+        transform=interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.run()
+
+    assert runtime_lifecycle.failed_ids == [shard.id]
+    assert runtime_lifecycle.failed_errors == ["Interrupted."]
+
+
+def test_worker_raises_sink_close_errors_after_success() -> None:
+    shard = _shard("p", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 1})]}
+
+    worker = _run_local_worker(
+        rows_by_shard=rows_by_shard,
+        runtime_lifecycle=runtime_lifecycle,
+        sink=_CloseFailingSink(),
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        worker.run()
+
+
+def test_worker_preserves_execution_failure_when_emitter_shutdown_fails() -> None:
+    shard = _shard("boom", 0, 1)
+    runtime_lifecycle = _FakeRuntimeLifecycle([shard])
+    rows_by_shard = {shard.id: [DictRow({"x": 2})]}
+
+    def maybe_fail(row: Row) -> Row:
+        raise RuntimeError("kaboom")
+
+    worker = _run_local_worker(
+        rows_by_shard=rows_by_shard,
+        runtime_lifecycle=runtime_lifecycle,
+        transform=maybe_fail,
+    )
+    worker.user_metrics_emitter = _ShutdownFailingTelemetryEmitter()
+
+    stats = worker.run()
+
+    assert stats.failed == 1
+    assert runtime_lifecycle.failed_ids == [shard.id]
+    assert runtime_lifecycle.failed_errors == ["kaboom | step_index=1"]
+
+
+__all__: list[str] = []

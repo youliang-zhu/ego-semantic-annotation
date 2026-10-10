@@ -1,0 +1,79 @@
+---
+title: "Sharding"
+description: "How Refiner divides source data across workers"
+---
+
+# Sharding
+
+A shard is a unit of input work. In launched runs, workers claim shards and
+process them independently.
+
+## Why shards matter
+
+Shard boundaries affect:
+
+- parallelism
+- retry granularity
+- output file layout
+- progress reporting
+- reducer work after writer stages
+
+## Common shard strategies
+
+| Input type | Typical shard strategy |
+| --- | --- |
+| Large line-oriented files | Split by byte ranges aligned to row boundaries. |
+| Many small files | Pack files into shards by estimated size. |
+| LeRobot episode parquet | Plan over episode metadata parquet files. |
+| HDF5 demos | Plan files, then emit matched groups. |
+| Zarr replay buffers | Plan row ranges from episode boundaries or leading-axis rows. |
+
+## Tuning shards
+
+Use `target_shard_bytes` when the reader can estimate byte size:
+
+```python
+pipeline = mdr.read_parquet(
+    "/data/episodes/*.parquet",
+    target_shard_bytes=256 * 1024 * 1024,
+)
+```
+
+Use `num_shards` when you want a coarse target:
+
+```python
+pipeline = mdr.read_lerobot(
+    "hf://datasets/acme/large-robot-dataset",
+    num_shards=128,
+)
+```
+
+Automatic planning produces at most 1,000 shards. When the normal target size
+would create more, Refiner combines adjacent work while keeping every input
+file, byte range, or row range in the resulting plan. Across readers, explicit
+`num_shards` values may request up to 10,000 shards; larger requests fail with
+a validation error.
+
+Zarr row-range shards refer to one input store, so automatic planning cannot
+combine more than 1,000 non-empty Zarr stores into one plan. For a larger set,
+group the stores upstream or pass an explicit `num_shards` value to opt into a
+plan within the 10,000-shard hard limit.
+
+Do not overfit shard count before measuring. Too few shards leave workers idle;
+too many shards add scheduling and output overhead.
+
+When a built-in reader receives `max_rows`, Refiner exposes one bounded source
+shard regardless of `num_shards`. This is intentional: the limit is global, so
+running several independently capped shards could emit `max_rows` from every
+worker. Remove `max_rows` for the production shard plan.
+
+## Shards and writers
+
+Writers usually write shard-local files first. Some writers add a reducer stage
+to merge or finalize metadata. For example, the LeRobot writer stages per-shard
+chunks and then reduces metadata; see [Writing LeRobot](../writing-data/lerobot.md).
+
+## Related pages
+
+- [Reader Model](reader-model.md)
+- [Local Launcher](../running-pipelines/local-launcher.md)

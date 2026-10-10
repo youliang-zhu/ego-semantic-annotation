@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from argparse import Namespace
+import sys
+
+from refiner.cli.common import create_client
+from refiner.cli.common import handle_error
+from refiner.cli.jobs.common import _executor_text
+from refiner.platform.auth import MacrodataCredentialsError
+from refiner.platform.client import MacrodataApiError
+
+
+def cmd_jobs_attach(args: Namespace) -> int:
+    from refiner.cli.run import cloud
+
+    try:
+        client = create_client()
+        payload = client.cli_get_job(job_id=args.job_id)
+    except (MacrodataApiError, MacrodataCredentialsError) as err:
+        return handle_error(err)
+
+    if not isinstance(payload, dict):
+        print("Job details unavailable.", file=sys.stderr)
+        return 1
+    if _executor_text(payload.get("executorKind")) != "cloud":
+        print(
+            "`macrodata jobs attach` is only supported for cloud jobs.", file=sys.stderr
+        )
+        return 1
+
+    try:
+        return cloud.attach_to_cloud_job(
+            client=client,
+            job_id=args.job_id,
+            initial_job_payload=payload,
+            force_attach=True,
+        )
+    except cloud.CloudAttachDetached:
+        return 130
+    except SystemExit as err:
+        code = err.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        print(str(code), file=sys.stderr)
+        return 1
+    except (MacrodataApiError, MacrodataCredentialsError) as err:
+        return handle_error(err)

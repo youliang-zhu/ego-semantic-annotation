@@ -1,0 +1,50 @@
+from __future__ import annotations
+import importlib
+
+import argparse
+import sys
+
+from refiner.cli.commands.auth import register_auth_commands
+from refiner.cli.commands.jobs import register_jobs_command
+from refiner.cli.commands.run import register_run_command
+from refiner.cli.commands.secrets import register_secrets_command
+from refiner.cli.commands.debug import register_debug_command
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="macrodata", description="Macrodata CLI")
+    subparsers = parser.add_subparsers(dest="command")
+    register_auth_commands(subparsers)
+    register_run_command(subparsers)
+    register_jobs_command(subparsers)
+    register_secrets_command(subparsers)
+    register_debug_command(subparsers)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        handler = getattr(args, "handler", None)
+        if handler is None:
+            parser.print_help()
+            return 0
+
+        if isinstance(handler, str):
+            try:
+                handler_module = importlib.import_module(args.handler_module)
+                handler = getattr(handler_module, args.handler)
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError("Could not load that command.") from e
+
+        return int(handler(args))
+    except KeyboardInterrupt as err:  # Ctrl+C/SIGINT catch-all
+        message = str(err).strip()
+        print(message or "Interrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

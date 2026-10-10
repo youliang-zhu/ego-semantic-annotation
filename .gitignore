@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.pre-commit-cache/
+.uv-cache/
+
+notebooks/
+thoughts/
+.worktrees/
+artifacts/
+
+# Local demo credentials, runtime, and scratch files
+.env
+.env.*
+!.env.example
+.runtime/
+.work/
+.ruff_cache/
+.pytest_cache/
+.cache/
+datasets/

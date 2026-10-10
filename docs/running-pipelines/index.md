@@ -1,0 +1,53 @@
+---
+title: "Running pipelines"
+description: "How Refiner pipelines execute on your own infrastructure"
+---
+
+# Running pipelines
+
+A Refiner pipeline can be evaluated two ways:
+
+| Mode | Use it when | Entry point |
+| --- | --- | --- |
+| In process | You are inspecting rows, testing a transform, or debugging quickly. | `iter_rows()`, `take()`, `materialize()` |
+| Local launch | You want real worker/shard behavior on your machine. | `launch_local(...)` |
+
+Start with [In-Process Debugging](in-process-debugging.md), then move to
+[Local Launcher](local-launcher.md).
+
+## Execution terms
+
+| Term | Meaning |
+| --- | --- |
+| Source | The reader that plans shards and emits input rows or tables. |
+| Shard | A unit of source work assigned to a worker. |
+| Worker | A process that claims shards, runs transforms, and writes output. |
+| Stage | A named pipeline with its own source, sink, and resources. Stages in one job run in order; writers may add internal follow-up stages. |
+| Sink | A writer attached to the end of the pipeline. |
+
+For input planning details, see [Reader Model](../reading-data/reader-model.md)
+and [Sharding](../reading-data/sharding.md).
+
+## Task shard claiming
+
+Each worker processes `mdr.task(...)` shards sequentially and claims one shard
+at a time by default. The worker does not claim another shard until the current
+shard's transforms and sink output finish. To preserve unbounded shard claiming:
+
+```python
+import refiner as mdr
+
+pipeline = mdr.task(
+    run_partition,
+    num_tasks=32,
+    claim_shards_sequentially=False,
+)
+```
+
+Reader pipelines remain unbounded by default, preserving their existing
+cross-shard batching behavior.
+
+## Related pages
+
+- [In-Process Debugging](in-process-debugging.md)
+- [Local Launcher](local-launcher.md)

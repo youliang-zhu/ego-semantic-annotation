@@ -1,0 +1,1 @@
+"""Macrodata platform integration package."""
